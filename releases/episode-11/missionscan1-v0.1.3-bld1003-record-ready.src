@@ -1,0 +1,777 @@
+// =======================================================================
+// ANE3 MISSIONSCAN 1 (missionscan1.src)
+// Episode 11 test candidate v0.1.3 bld 1003
+// -----------------------------------------------------------------------
+// One-shot mission intake and normalization.
+//
+// Lifecycle:
+//   one process -> one mail login -> one fetch -> required thread reads
+//   -> raw/normalized persistence -> derived mission queue
+//   -> actionable target reconciliation -> exit
+//
+// The MailID returned by Grey Hack is treated as a thread identifier.
+// Known Mission Contract threads are reread because later replies change
+// mission status, attempt counts, and client-confirmed outcomes.
+//
+// This component never deletes, sends, or modifies mail.
+// =======================================================================
+
+// ANE3_META|type=script|name=missionscan1|version=0.1.3|last_version=0.1.2|last_bld=1002
+
+SCRIPT_NAME = "missionscan1"
+SCRIPT_COMMAND = "missionscan1"
+SCRIPT_VERSION = "0.1.3"
+SCRIPT_LAST_VERSION = "0.1.2"
+SCRIPT_LAST_BLD = 1002
+
+shell = get_shell
+computer = shell.host_computer
+
+import_code("/home/Archeagus/ANE3/SRC/LIB/lib_functions.src")
+import_code("/home/Archeagus/ANE3/CONFIG/PRIVATE/mail_credentials")
+
+SCRIPT_BLD = calc_bld(SCRIPT_VERSION, SCRIPT_LAST_VERSION, SCRIPT_LAST_BLD)
+
+scanner_name = "missionscan1"
+state_grace = 3
+active_lease = 30
+
+manifestFile = globals.computer.File(ane_path("MANIFEST") + "/ane3.manifest")
+runLog = globals.computer.File(ane_path("LOG") + "/run.log")
+stateFile = init_file("state_missionscan1.txt", "STATES")
+
+// -----------------------------------------------------------------------
+// Shared-file and state helpers
+// -----------------------------------------------------------------------
+
+refresh_shared_files = function()
+	if globals.manifestFile == null then
+		globals.manifestFile = globals.computer.File(ane_path("MANIFEST") + "/ane3.manifest")
+	end if
+
+	if globals.runLog == null then
+		globals.runLog = globals.computer.File(ane_path("LOG") + "/run.log")
+	end if
+end function
+
+report_state = function(activity, leaseSeconds, detail="")
+	refresh_shared_files()
+	runtimePolicy = check_runtime_policy(globals.manifestFile)
+
+	if runtimePolicy == "UPDATE_AVAILABLE" then
+		log_state("UPDATE_AVAILABLE", leaseSeconds, detail + " | redeploy recommended")
+	else
+		log_state(activity, leaseSeconds, detail)
+	end if
+
+	return runtimePolicy
+end function
+
+fail_missionscan = function(message)
+	log_event("MissionScan error: " + message, "red")
+	log_state("ERROR", 0, message)
+	exit(color_text("MissionScan error: " + message, "red"))
+end function
+
+// -----------------------------------------------------------------------
+// Local filesystem helpers
+// -----------------------------------------------------------------------
+
+ensure_child_folder = function(parentPath, folderName)
+	path = parentPath + "/" + folderName
+	folderObj = globals.computer.File(path)
+	if folderObj != null then return path
+
+	createResult = globals.computer.create_folder(parentPath, folderName)
+	if createResult != 1 then return ""
+	return path
+end function
+
+touch_file_at = function(folderPath, fileName)
+	filePath = folderPath + "/" + fileName
+	fileObj = globals.computer.File(filePath)
+	if fileObj != null then return fileObj
+
+	touchResult = globals.computer.touch(folderPath, fileName)
+	if touchResult != 1 then return null
+	return globals.computer.File(filePath)
+end function
+
+set_content_checked = function(fileObj, content, context)
+	if fileObj == null then
+		log_event("Missing file while writing " + context, "red")
+		return 0
+	end if
+
+	result = fileObj.set_content(content)
+	if result == 1 then return 1
+
+	log_event("Unable to write " + context + ": " + result, "red")
+	return 0
+end function
+
+// -----------------------------------------------------------------------
+// Text and record helpers
+// -----------------------------------------------------------------------
+
+pad_number = function(value, width)
+	text = "" + value
+	while text.len < width
+		text = "0" + text
+	end while
+	return text
+end function
+
+sanitize_index_value = function(value)
+	if value == null then return ""
+	clean = value.replace("[|]", "/")
+	clean = clean.replace(char(10), " ")
+	return clean.trim
+end function
+
+strip_markup = function(value)
+	if value == null then return ""
+	return value.replace("<[^>]*>", "")
+end function
+
+trim_period = function(value)
+	text = value.trim
+	if text.len > 0 and slice(text, text.len - 1) == "." then
+		return slice(text, 0, text.len - 1)
+	end if
+	return text
+end function
+
+record_value = function(recordFile, keyName, defaultValue="")
+	if recordFile == null then return defaultValue
+	prefix = keyName + "="
+	lines = safe_content(recordFile).split(char(10))
+
+	for line in lines
+		if line.indexOf(prefix) == 0 then return slice(line, prefix.len)
+	end for
+
+	return defaultValue
+end function
+
+preview_field = function(previewText, fieldName)
+	if previewText == null then return ""
+	prefix = fieldName + ":"
+	lines = previewText.split(char(10))
+
+	for line in lines
+		cleanLine = line.trim
+		if cleanLine.indexOf(prefix) == 0 then
+			return slice(cleanLine, prefix.len).trim
+		end if
+	end for
+
+	return ""
+end function
+
+preview_thread_id = function(previewText)
+	threadId = preview_field(previewText, "MailID")
+	if threadId != "" then return threadId
+	return preview_field(previewText, "Mail ID")
+end function
+
+line_after_phrase = function(cleanText, phraseText)
+	lowerPhrase = phraseText.lower
+	lines = cleanText.split(char(10))
+
+	for line in lines
+		cleanLine = line.trim
+		lowerLine = cleanLine.lower
+		position = lowerLine.indexOf(lowerPhrase)
+		if position != null then
+			return trim_period(slice(cleanLine, position + phraseText.len))
+		end if
+	end for
+
+	return ""
+end function
+
+first_contract_line = function(cleanText)
+	seenSubject = 0
+	lines = cleanText.split(char(10))
+
+	for line in lines
+		cleanLine = line.trim
+		lowerLine = cleanLine.lower
+
+		if lowerLine.indexOf("subject:") == 0 then
+			seenSubject = 1
+			continue
+		end if
+
+		if not seenSubject then continue
+		if cleanLine == "" then continue
+		if cleanLine.indexOf(">") == 0 then continue
+		if lowerLine.indexOf("you have not completed the order requirements") == 0 then continue
+		if lowerLine.indexOf("the customer is satisfied with the job") == 0 then continue
+		return cleanLine
+	end for
+
+	return ""
+end function
+
+ip_candidates = function(cleanText)
+	candidates = []
+	token = ""
+
+	for charIndex in cleanText.indexes
+		character = slice(cleanText, charIndex, charIndex + 1)
+
+		if character == "." or character.is_match("[0-9]") then
+			token = token + character
+		else
+			if token != "" and is_valid_ip(token) then candidates.push(token)
+			token = ""
+		end if
+	end for
+
+	if token != "" and is_valid_ip(token) then candidates.push(token)
+	return candidates
+end function
+
+scoped_ip_from_thread = function(cleanText, wantLan)
+	candidates = ip_candidates(cleanText)
+
+	for candidate in candidates
+		if wantLan and is_lan_ip(candidate) then return candidate
+		if not wantLan and not is_lan_ip(candidate) then return candidate
+	end for
+
+	return ""
+end function
+
+count_occurrences = function(textValue, needle)
+	if textValue == null or needle == "" then return 0
+	count = 0
+	startIndex = 0
+
+	while 1
+		found = textValue.indexOf(needle, startIndex)
+		if found == null then break
+		count = count + 1
+		startIndex = found + needle.len
+	end while
+
+	return count
+end function
+
+count_operator_replies = function(cleanText)
+	count = 0
+	lines = cleanText.split(char(10))
+	for line in lines
+		cleanLine = line.trim
+		if cleanLine.indexOf(">") == 0 then count = count + 1
+	end for
+	return count
+end function
+
+mission_type_from_thread = function(cleanText)
+	lowerText = cleanText.lower
+	if lowerText.indexOf("change some grades") != null then return "ACADEMIC_RECORD"
+	if lowerText.indexOf("modify the information of a police record") != null then return "POLICE_RECORD"
+	if lowerText.indexOf("get a file that contains important information") != null then return "FILE_RETRIEVAL"
+	return "UNKNOWN"
+end function
+
+mission_lifecycle = function(cleanText)
+	lowerText = cleanText.lower
+	attempts = count_operator_replies(cleanText)
+	failedAttempts = count_occurrences(lowerText, "you have not completed the order requirements, the mission is still active.")
+
+	successPosition = lowerText.lastIndexOf("the customer is satisfied with the job. there has been an income in your account.")
+	unmetPosition = lowerText.lastIndexOf("you have not completed the order requirements, the mission is still active.")
+
+	statusName = "QUEUED"
+	lastEvent = "CONTRACT_RECEIVED"
+
+	if attempts > 0 then
+		statusName = "ATTEMPTED"
+		lastEvent = "OPERATOR_SUBMITTED"
+	end if
+
+	if unmetPosition >= 0 then
+		statusName = "ATTEMPTED"
+		lastEvent = "REQUIREMENTS_UNMET"
+	end if
+
+	if successPosition >= 0 and successPosition > unmetPosition then
+		statusName = "COMPLETED"
+		lastEvent = "CLIENT_SATISFIED"
+	end if
+
+	return [statusName, attempts, failedAttempts, lastEvent]
+end function
+
+academic_detail = function(cleanText)
+	detail = line_after_phrase(cleanText, "Client wants to modify the subject ")
+	lowerDetail = detail.lower
+	separator = lowerDetail.indexOf(" to ")
+	if separator != null then return slice(detail, 0, separator).trim
+	return detail
+end function
+
+mission_objective = function(cleanText, missionType)
+	if missionType == "ACADEMIC_RECORD" then
+		lines = cleanText.split(char(10))
+		for line in lines
+			cleanLine = line.trim
+			lowerLine = cleanLine.lower
+			if lowerLine.indexOf("client wants to modify the subject ") == 0 then return trim_period(cleanLine)
+		end for
+	end if
+
+	return trim_period(first_contract_line(cleanText))
+end function
+
+// -----------------------------------------------------------------------
+// Mission manifest and stable ID allocation
+// manifest.db:
+// mission_id|mail_thread_id|status|queue_status|mission_type|target_ip|
+// target_lan_ip|record_file|thread_revision|updated
+// -----------------------------------------------------------------------
+
+manifest_line_by_thread = function(threadId)
+	lines = safe_content(globals.missionManifest).split(char(10))
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len > 1 and parts[1] == threadId then return line
+	end for
+	return ""
+end function
+
+upsert_manifest_line = function(missionId, newLine)
+	lines = safe_content(globals.missionManifest).split(char(10))
+	outputLines = []
+	found = 0
+
+	for line in lines
+		if line == "" then continue
+		if line.indexOf("#") == 0 then
+			outputLines.push(line)
+			continue
+		end if
+
+		parts = split_fields(line)
+		if parts.len > 0 and parts[0] == missionId then
+			if not found then outputLines.push(newLine)
+			found = 1
+		else
+			outputLines.push(line)
+		end if
+	end for
+
+	if not found then outputLines.push(newLine)
+	return set_content_checked(globals.missionManifest, outputLines.join(char(10)), "mission manifest")
+end function
+
+next_mission_id = function()
+	maxNumber = 0
+	lines = safe_content(globals.missionManifest).split(char(10))
+
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		missionId = get_field(line, 0)
+		if missionId.indexOf("M-") != 0 then continue
+		numberValue = slice(missionId, 2).to_int
+		if numberValue > maxNumber then maxNumber = numberValue
+	end for
+
+	return "M-" + pad_number(maxNumber + 1, 6)
+end function
+
+// -----------------------------------------------------------------------
+// Mission-to-target relationship history
+// mission-targets.db:
+// mission_id|public_ip|lan_ip|target_role|link_status|thread_revision|
+// first_seen|last_seen|notes
+// -----------------------------------------------------------------------
+
+supersede_active_links = function(missionId)
+	lines = safe_content(globals.missionTargets).split(char(10))
+	outputLines = []
+
+	for line in lines
+		if line == "" then continue
+		if line.indexOf("#") == 0 then
+			outputLines.push(line)
+			continue
+		end if
+
+		parts = split_fields(line)
+		if parts.len >= 9 and parts[0] == missionId and parts[4] == "ACTIVE" then
+			newLine = parts[0] + "|" + parts[1] + "|" + parts[2] + "|" + parts[3] + "|SUPERSEDED|" + parts[5] + "|" + parts[6] + "|" + current_date + "|" + parts[8]
+			outputLines.push(newLine)
+		else
+			outputLines.push(line)
+		end if
+	end for
+
+	return set_content_checked(globals.missionTargets, outputLines.join(char(10)), "mission target links")
+end function
+
+write_current_links = function(missionId, publicIp, lanIp, threadRevision)
+	if not supersede_active_links(missionId) then return 0
+
+	if publicIp != "" then
+		publicLine = missionId + "|" + publicIp + "||PUBLIC_TARGET|ACTIVE|" + threadRevision + "|" + current_date + "|" + current_date + "|"
+		append_line(globals.missionTargets, publicLine)
+	end if
+
+	if publicIp != "" and lanIp != "" then
+		lanLine = missionId + "|" + publicIp + "|" + lanIp + "|LAN_TARGET|ACTIVE|" + threadRevision + "|" + current_date + "|" + current_date + "|Scoped by public target"
+		append_line(globals.missionTargets, lanLine)
+	end if
+
+	return 1
+end function
+
+// -----------------------------------------------------------------------
+// Normalized record writer
+// -----------------------------------------------------------------------
+
+build_record = function(missionId, threadId, threadRevision, statusName, queueStatus, missionType, subjectText, senderText, objectiveText, targetIp, targetLanIp, targetName, targetDetail, attempts, failedAttempts, lastEvent, parseStatus, createdDate, existingRecord)
+	missionLevel = record_value(existingRecord, "mission_level", "UNKNOWN")
+	missionPayout = record_value(existingRecord, "mission_payout", "UNKNOWN")
+	priority = record_value(existingRecord, "priority", "NORMAL")
+	expscanStatus = record_value(existingRecord, "expscan_status", "NOT_STARTED")
+	expscanSession = record_value(existingRecord, "expscan_session", "")
+	selectedExploit = record_value(existingRecord, "selected_exploit", "")
+	accessResult = record_value(existingRecord, "access_result", "")
+	privilegeResult = record_value(existingRecord, "privilege_result", "")
+	completionSubmitted = record_value(existingRecord, "completion_submitted", "false")
+	notes = record_value(existingRecord, "notes", "")
+
+	if attempts > 0 then completionSubmitted = "true"
+
+	content = "schema_version=1" + char(10)
+	content = content + "mission_id=" + missionId + char(10)
+	content = content + "mail_thread_id=" + threadId + char(10)
+	content = content + "thread_revision=" + threadRevision + char(10) + char(10)
+
+	content = content + "status=" + statusName + char(10)
+	content = content + "queue_status=" + queueStatus + char(10)
+	content = content + "priority=" + priority + char(10)
+	content = content + "mission_type=" + missionType + char(10) + char(10)
+
+	content = content + "subject=" + subjectText + char(10)
+	content = content + "sender=" + senderText + char(10) + char(10)
+
+	content = content + "objective=" + objectiveText + char(10)
+	content = content + "target_ip=" + targetIp + char(10)
+	content = content + "target_lan_ip=" + targetLanIp + char(10)
+	content = content + "target_name=" + targetName + char(10)
+	content = content + "target_detail=" + targetDetail + char(10) + char(10)
+
+	content = content + "mission_level=" + missionLevel + char(10)
+	content = content + "mission_payout=" + missionPayout + char(10) + char(10)
+
+	content = content + "attempts=" + attempts + char(10)
+	content = content + "failed_attempts=" + failedAttempts + char(10)
+	content = content + "last_thread_event=" + lastEvent + char(10) + char(10)
+
+	content = content + "parse_status=" + parseStatus + char(10)
+	content = content + "created=" + createdDate + char(10)
+	content = content + "updated=" + current_date + char(10)
+	content = content + "source_file=/ANE3/MISSIONS/RAW/" + missionId + ".txt" + char(10) + char(10)
+
+	content = content + "expscan_status=" + expscanStatus + char(10)
+	content = content + "expscan_session=" + expscanSession + char(10)
+	content = content + "selected_exploit=" + selectedExploit + char(10)
+	content = content + "access_result=" + accessResult + char(10)
+	content = content + "privilege_result=" + privilegeResult + char(10)
+	content = content + "completion_submitted=" + completionSubmitted + char(10) + char(10)
+
+	content = content + "notes=" + notes
+	return content
+end function
+
+// -----------------------------------------------------------------------
+// Derived Mission Runner queue
+// mission-queue.db:
+// mission_id|priority|queue_status|mission_type|target_ip|target_lan_ip|updated
+// -----------------------------------------------------------------------
+
+rebuild_mission_queue = function()
+	outputLines = ["# mission_id|priority|queue_status|mission_type|target_ip|target_lan_ip|updated"]
+	lines = safe_content(globals.missionManifest).split(char(10))
+
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		missionId = get_field(line, 0)
+		recordFile = globals.computer.File(ane_path("MISSIONS") + "/" + missionId + ".db")
+		if recordFile == null then continue
+
+		queueStatus = record_value(recordFile, "queue_status", "")
+		if queueStatus != "AVAILABLE" then continue
+
+		priority = record_value(recordFile, "priority", "NORMAL")
+		missionType = record_value(recordFile, "mission_type", "UNKNOWN")
+		targetIp = record_value(recordFile, "target_ip", "")
+		targetLanIp = record_value(recordFile, "target_lan_ip", "")
+		updatedDate = record_value(recordFile, "updated", "")
+
+		if not is_valid_ip(targetIp) then continue
+
+		queueLine = missionId + "|" + priority + "|" + queueStatus + "|" + missionType + "|" + targetIp + "|" + targetLanIp + "|" + updatedDate
+		outputLines.push(queueLine)
+	end for
+
+	return set_content_checked(globals.missionQueue, outputLines.join(char(10)), "Mission Runner queue")
+end function
+
+// -----------------------------------------------------------------------
+// Actionable target preparation reconciliation
+// target-seeds.db:
+// ip|source|source_ref|request_mode|status|created|updated|notes
+//
+// MissionScan only records that ANE3 has a reason to care about a target.
+// MapScan remains responsible for scan/reuse/refresh/retry policy.
+// -----------------------------------------------------------------------
+
+mission_target_seed_exists = function(missionId, ipAddress)
+	lines = safe_content(globals.targetSeeds).split(char(10))
+
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len < 3 then continue
+		if parts[0] == ipAddress and parts[1] == "MISSION" and parts[2] == missionId then return 1
+	end for
+
+	return 0
+end function
+
+reconcile_actionable_targets = function()
+	seededCount = 0
+	existingCount = 0
+	lines = safe_content(globals.missionQueue).split(char(10))
+
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len < 6 then continue
+
+		missionId = parts[0]
+		queueStatus = parts[2]
+		targetIp = parts[4]
+
+		if queueStatus != "AVAILABLE" then continue
+		if not is_valid_ip(targetIp) then continue
+
+		if mission_target_seed_exists(missionId, targetIp) then
+			existingCount = existingCount + 1
+			continue
+		end if
+
+		seedLine = targetIp + "|MISSION|" + missionId + "|NORMAL|QUEUED|" + current_date + "|" + current_date + "|Actionable MissionScan target"
+		if not append_line(globals.targetSeeds, seedLine) then return [-1, seededCount, existingCount]
+		seededCount = seededCount + 1
+	end for
+
+	return [1, seededCount, existingCount]
+end function
+
+// -----------------------------------------------------------------------
+// Parameters
+// -----------------------------------------------------------------------
+
+forceReparse = 0
+
+if params.len > 1 or has_flag("-h") or has_flag("--help") then
+	exit("<color=yellow>Usage: " + program_path.split("/")[-1] + " [optional --reparse]</color>")
+end if
+
+if params.len == 1 then
+	if params[0] == "--reparse" then
+		forceReparse = 1
+	else
+		fail_missionscan("Invalid parameter " + params[0])
+	end if
+end if
+
+// -----------------------------------------------------------------------
+// Bootstrap
+// -----------------------------------------------------------------------
+
+missionsPath = init_folder("MISSIONS")
+rawPath = ensure_child_folder(missionsPath, "RAW")
+if rawPath == "" then fail_missionscan("Unable to create /ANE3/MISSIONS/RAW")
+
+missionManifest = init_file("manifest.db", "MISSIONS", "# mission_id|mail_thread_id|status|queue_status|mission_type|target_ip|target_lan_ip|record_file|thread_revision|updated")
+missionTargets = init_file("mission-targets.db", "MISSIONS", "# mission_id|public_ip|lan_ip|target_role|link_status|thread_revision|first_seen|last_seen|notes")
+missionQueue = init_file("mission-queue.db", "DB", "# mission_id|priority|queue_status|mission_type|target_ip|target_lan_ip|updated")
+targetSeeds = init_file("target-seeds.db", "DB", "# ip|source|source_ref|request_mode|status|created|updated|notes")
+
+// -----------------------------------------------------------------------
+// One-shot mail synchronization
+// -----------------------------------------------------------------------
+
+print_log("ANE3 MISSIONSCAN 1", "#4da6ff")
+print_log("----------------------", "#4da6ff")
+print_log("missionscan1 v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + " | lib_functions v" + ANE3_LIB_VERSION + " bld " + ANE3_LIB_BLD, "white")
+print_log("One login, one fetch, complete Mission Contract thread synchronization.", "white")
+if forceReparse then print_log("Repair mode: reparsing all known Mission Contract threads.", "yellow")
+print_log("", "white")
+
+report_state("ACTIVE", active_lease, "Connecting to mail")
+mailSession = mail_login(ANE3_MAIL_USER, ANE3_MAIL_PASSWORD)
+
+if mailSession == null then fail_missionscan("Mail login returned null")
+if typeof(mailSession) == "string" then fail_missionscan("Mail login failed: " + mailSession)
+
+report_state("ACTIVE", active_lease, "Fetching mailbox")
+fetchResult = mailSession.fetch
+
+if fetchResult == null then fail_missionscan("Mail fetch returned null")
+if typeof(fetchResult) == "string" then fail_missionscan("Mail fetch failed: " + fetchResult)
+
+previewCount = fetchResult.len
+contractCount = 0
+newCount = 0
+updatedCount = 0
+unchangedCount = 0
+reparsedCount = 0
+partialCount = 0
+readErrorCount = 0
+
+for previewIndex in fetchResult.indexes
+	preview = fetchResult[previewIndex]
+	subjectText = preview_field(preview, "Subject")
+	if subjectText != "Mission Contract" then continue
+
+	contractCount = contractCount + 1
+	threadId = preview_thread_id(preview)
+	senderText = preview_field(preview, "From")
+
+	if threadId == "" then
+		readErrorCount = readErrorCount + 1
+		log_event("Mission preview " + previewIndex + " has no MailID", "yellow")
+		continue
+	end if
+
+	report_state("ACTIVE", active_lease, "Reading mission thread " + contractCount)
+	threadBody = mailSession.read(threadId)
+
+	if threadBody == null then
+		readErrorCount = readErrorCount + 1
+		log_event("Mission thread read returned null for " + threadId, "yellow")
+		continue
+	end if
+
+	if threadBody.indexOf("Subject: Mission Contract") == null then
+		readErrorCount = readErrorCount + 1
+		log_event("Mission thread read did not return a Mission Contract for " + threadId, "yellow")
+		continue
+	end if
+
+	existingManifestLine = manifest_line_by_thread(threadId)
+	isNew = existingManifestLine == ""
+
+	if isNew then
+		missionId = next_mission_id()
+		threadRevision = 1
+		createdDate = current_date
+	else
+		missionId = get_field(existingManifestLine, 0)
+		threadRevision = get_field(existingManifestLine, 8).to_int
+		createdDate = ""
+	end if
+
+	rawFile = touch_file_at(globals.rawPath, missionId + ".txt")
+	if rawFile == null then fail_missionscan("Unable to create raw thread file for " + missionId)
+
+	recordFile = touch_file_at(globals.missionsPath, missionId + ".db")
+	if recordFile == null then fail_missionscan("Unable to create mission record for " + missionId)
+
+	if not isNew then
+		createdDate = record_value(recordFile, "created", current_date)
+		threadUnchanged = safe_content(rawFile) == threadBody
+		storedTargetIp = record_value(recordFile, "target_ip", "")
+		storedParseStatus = record_value(recordFile, "parse_status", "")
+		needsRepair = storedTargetIp == "" or storedParseStatus == "NEEDS_REVIEW"
+
+		if threadUnchanged and not forceReparse and not needsRepair then
+			unchangedCount = unchangedCount + 1
+			continue
+		end if
+
+		if threadUnchanged then
+			reparsedCount = reparsedCount + 1
+		else
+			threadRevision = threadRevision + 1
+		end if
+	end if
+
+	report_state("ACTIVE", active_lease, "Parsing " + missionId)
+	cleanThread = strip_markup(threadBody)
+	missionType = mission_type_from_thread(cleanThread)
+	targetIp = scoped_ip_from_thread(cleanThread, 0)
+	targetLanIp = scoped_ip_from_thread(cleanThread, 1)
+	targetName = line_after_phrase(cleanThread, "The record to modify belongs to: ")
+	targetDetail = ""
+	if missionType == "ACADEMIC_RECORD" then targetDetail = academic_detail(cleanThread)
+	objectiveText = mission_objective(cleanThread, missionType)
+	lifecycle = mission_lifecycle(cleanThread)
+	statusName = lifecycle[0]
+	attempts = lifecycle[1]
+	failedAttempts = lifecycle[2]
+	lastEvent = lifecycle[3]
+
+	parseStatus = "PARSED"
+	if targetIp == "" then parseStatus = "NEEDS_REVIEW"
+	if parseStatus == "PARSED" and (missionType == "UNKNOWN" or objectiveText == "") then parseStatus = "PARTIAL"
+	if parseStatus != "PARSED" then partialCount = partialCount + 1
+
+	queueStatus = "AVAILABLE"
+	if parseStatus == "NEEDS_REVIEW" then queueStatus = "REVIEW"
+	if statusName == "COMPLETED" or statusName == "FAILED" or statusName == "PAUSED" then queueStatus = "CLOSED"
+
+	recordContent = build_record(missionId, threadId, threadRevision, statusName, queueStatus, missionType, sanitize_index_value(subjectText), sanitize_index_value(senderText), sanitize_index_value(objectiveText), targetIp, targetLanIp, sanitize_index_value(targetName), sanitize_index_value(targetDetail), attempts, failedAttempts, lastEvent, parseStatus, createdDate, recordFile)
+
+	if not set_content_checked(rawFile, threadBody, "raw thread " + missionId) then fail_missionscan("Unable to preserve raw thread " + missionId)
+	if not set_content_checked(recordFile, recordContent, "mission record " + missionId) then fail_missionscan("Unable to write mission record " + missionId)
+	if not write_current_links(missionId, targetIp, targetLanIp, threadRevision) then fail_missionscan("Unable to update mission-target links for " + missionId)
+
+	recordPath = "/ANE3/MISSIONS/" + missionId + ".db"
+	manifestLine = missionId + "|" + threadId + "|" + statusName + "|" + queueStatus + "|" + missionType + "|" + targetIp + "|" + targetLanIp + "|" + recordPath + "|" + threadRevision + "|" + current_date
+	if not upsert_manifest_line(missionId, manifestLine) then fail_missionscan("Unable to update mission manifest for " + missionId)
+
+	if isNew then
+		newCount = newCount + 1
+	else
+		updatedCount = updatedCount + 1
+	end if
+end for
+
+report_state("ACTIVE", active_lease, "Rebuilding Mission Runner queue")
+if not rebuild_mission_queue() then fail_missionscan("Unable to rebuild mission queue")
+
+report_state("ACTIVE", active_lease, "Reconciling actionable mission targets")
+seedResult = reconcile_actionable_targets()
+if seedResult[0] != 1 then fail_missionscan("Unable to reconcile actionable mission targets")
+seededTargetCount = seedResult[1]
+existingTargetCount = seedResult[2]
+
+print_log("Mailbox previews:   " + previewCount, "white")
+print_log("Mission contracts:  " + contractCount, "white")
+print_log("New missions:       " + newCount, "white")
+print_log("Updated missions:   " + updatedCount, "white")
+print_log("Unchanged missions: " + unchangedCount, "white")
+print_log("Reparsed missions:  " + reparsedCount, "white")
+print_log("Partial/review:     " + partialCount, "white")
+print_log("Read errors:        " + readErrorCount, "white")
+print_log("Targets seeded:     " + seededTargetCount, "white")
+print_log("Targets reconciled: " + existingTargetCount, "white")
+print_log("", "white")
+print_log("Mission manifest: /ANE3/MISSIONS/manifest.db", "white")
+print_log("Mission queue:    /ANE3/DB/mission-queue.db", "white")
+
+summary = "Scanned " + previewCount + " previews; " + contractCount + " contracts; " + newCount + " new; " + updatedCount + " updated; " + reparsedCount + " reparsed; " + unchangedCount + " unchanged; " + seededTargetCount + " targets seeded; " + existingTargetCount + " already reconciled"
+log_event("MissionScan complete: " + summary, "#4da6ff")
+shutdown("MissionScan complete. " + summary)
