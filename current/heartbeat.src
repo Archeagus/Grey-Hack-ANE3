@@ -1,384 +1,446 @@
 // =======================================================================
-// ANE3 SHARED FUNCTIONS (lib_functions.src)
-// Record-ready v0.1.6
+// ANE3 HEARTBEAT (heartbeat.src)
+// Episode 8 record-ready v0.1.15 bld 1015
 // -----------------------------------------------------------------------
-// Purpose:
-//   Shared ANE3 runtime plumbing only.
-//   This file should not contain scanner behavior, database schema logic,
-//   exploit logic, target selection, manifest ownership, or script-specific
-//   file wrappers.
+// Dynamic console monitor for ANE3 runtime health and source freshness.
+// Heartbeat observes. It does not launch, kill, or restart components.
+//
+// Runtime registry:
+//   <home_dir>/ANE3/STATES/state_*.txt
+//
+// Source registry:
+//   <home_dir>/ANE3/SRC/*.src
+//   <home_dir>/ANE3/SRC/LIB/*.src
+//
+// Heartbeat discovers components from their own state reports. It does not
+// maintain a hardcoded scanner list. Obsolete state files remain visible as
+// stale registrations until they are deliberately removed.
+//
+// Heartbeat owns / creates:
+//   <home_dir>/ANE3/MANIFEST/ane3.manifest
+//   <home_dir>/ANE3/LOG/run.log
+//   <home_dir>/ANE3/STATES/state_heartbeat.txt
+//
+// Heartbeat excludes its own state from the dashboard. Mission Runner is
+// responsible for watching Heartbeat.
+//
+// Manifest line format:
+//   type|name|version|bld|path|last_checked
+//
+// Runtime state line format:
+//   scanner|online_state|activity|wait_seconds|last_beat|expires_at|script_version|script_bld|lib_version|lib_bld|detail
 // =======================================================================
 
-// ANE3_META|type=lib|name=lib_functions|version=0.1.6|last_version=0.1.5|last_bld=1005
+// ANE3_META|type=script|name=heartbeat|version=0.1.15|last_version=0.1.14|last_bld=1014
+
+SCRIPT_NAME = "heartbeat"
+SCRIPT_COMMAND = "heartbeat"
+SCRIPT_VERSION = "0.1.15"
+SCRIPT_LAST_VERSION = "0.1.14"
+SCRIPT_LAST_BLD = 1014
+
+shell = get_shell
+computer = shell.host_computer
+
+import_code("/home/Archeagus/ANE3/SRC/LIB/lib_functions.src")
+
+SCRIPT_BLD = calc_bld(SCRIPT_VERSION, SCRIPT_LAST_VERSION, SCRIPT_LAST_BLD)
+
+scanner_name = "heartbeat"
+state_grace = 3
+
+manifest_refresh_interval = 3600
+state_poll_interval = 5
+
+manifestFile = init_file("ane3.manifest", "MANIFEST")
+runLog = init_file("run.log", "LOG")
+stateFile = init_file("state_heartbeat.txt", "STATES")
+
+statesPath = ane_path("STATES")
+srcPath = ane_path("SRC")
+libPath = srcPath + "/LIB"
+
+// Heartbeat cannot compare lease timestamps written from another program's
+// process-local `time` clock. It therefore observes each state file itself:
+// a live component must rewrite its state within wait_seconds + grace.
+observedStateFiles = []
+observedStateContent = []
+observedStateChangedAt = []
 
 // -----------------------------------------------------------------------
-// Version / build metadata
-// -----------------------------------------------------------------------
-// ANE3 versions are major.minor.patch tuples, not decimal numbers.
-// GreyScript split delimiters are regular expressions; character classes
-// are used for literal periods and pipes: [.] and [|].
-//
-// version_score = (major * 1000000) + (minor * 1000) + patch
-// current_bld = last_bld
-//             + version_score(current_version)
-//             - version_score(last_version)
-//
-// Example:
-//   v0.1.5 bld 1005 -> v0.1.6 bld 1006
+// Local text helpers
 // -----------------------------------------------------------------------
 
-ANE3_LIB_NAME = "lib_functions"
-ANE3_LIB_VERSION = "0.1.6"
-ANE3_LIB_LAST_VERSION = "0.1.5"
-ANE3_LIB_LAST_BLD = 1005
-
-version_score = function(versionText)
-	parts = versionText.split("[.]")
-	major = 0
-	minor = 0
-	patch = 0
-
-	if parts.len > 0 then major = parts[0].to_int
-	if parts.len > 1 then minor = parts[1].to_int
-	if parts.len > 2 then patch = parts[2].to_int
-
-	return (major * 1000000) + (minor * 1000) + patch
+text_line = function(content, line)
+	if content == "" then return line
+	return content + char(10) + line
 end function
 
-calc_bld = function(currentVersion, lastVersion, lastBld)
-	return lastBld + version_score(currentVersion) - version_score(lastVersion)
+starts_with = function(value, prefix)
+	if value == null then return 0
+	return value.indexOf(prefix) == 0
 end function
 
-ANE3_LIB_BLD = calc_bld(ANE3_LIB_VERSION, ANE3_LIB_LAST_VERSION, ANE3_LIB_LAST_BLD)
-
-// -----------------------------------------------------------------------
-// ANE3 path / filesystem primitives
-// -----------------------------------------------------------------------
-
-ane_root = function()
-	return home_dir + "/ANE3"
+ends_with = function(value, suffix)
+	if value == null then return 0
+	if value.len < suffix.len then return 0
+	return slice(value, value.len - suffix.len) == suffix
 end function
 
-ane_path = function(folder="/")
-	root = ane_root()
+meta_value = function(metaLine, keyName, defaultValue="")
+	parts = split_fields(metaLine)
+	keyPrefix = keyName + "="
 
-	if folder == "/" then return root
-	if folder == "" then return root
+	for p in parts
+		if p.indexOf(keyPrefix) == 0 then
+			keyParts = p.split("=")
+			if keyParts.len > 1 then return keyParts[1]
+		end if
+	end for
 
-	return root + "/" + folder
+	return defaultValue
 end function
 
-init_folder = function(folder="/")
-	rootParent = home_dir
-	rootPath = ane_root()
-
-	rootObj = globals.computer.File(rootPath)
-	if rootObj == null then globals.computer.create_folder(rootParent, "ANE3")
-
-	if folder == "/" then return rootPath
-	if folder == "" then return rootPath
-
-	folderPath = ane_path(folder)
-	folderObj = globals.computer.File(folderPath)
-	if folderObj == null then globals.computer.create_folder(rootPath, folder)
-
-	return folderPath
-end function
-
-init_file = function(filename, folder="/", defaultContent="")
-	folderPath = init_folder(folder)
-	filePath = folderPath + "/" + filename
-
-	fileObj = globals.computer.File(filePath)
-	if fileObj == null then
-		globals.computer.touch(folderPath, filename)
-		fileObj = globals.computer.File(filePath)
-		if fileObj != null then fileObj.set_content(defaultContent)
-	end if
-
-	return fileObj
-end function
-
-// -----------------------------------------------------------------------
-// Basic text / file primitives
-// -----------------------------------------------------------------------
-
-safe_content = function(fileObj)
+source_meta_line = function(fileObj)
 	if fileObj == null then return ""
-	content = fileObj.get_content()
-	if content == null then return ""
-	return content
-end function
 
-append_line = function(fileObj, line)
-	if fileObj == null then return 0
-
-	content = safe_content(fileObj)
-	if content == "" then
-		fileObj.set_content(line)
-	else
-		fileObj.set_content(content + char(10) + line)
-	end if
-
-	return 1
-end function
-
-contains_line = function(fileObj, line)
-	if fileObj == null then return 0
-
-	content = safe_content(fileObj)
-	wrappedContent = char(10) + content + char(10)
-	wrappedLine = char(10) + line + char(10)
-
-	if wrappedContent.indexOf(wrappedLine) == null then return 0
-	return 1
-end function
-
-append_unique = function(fileObj, line)
-	if contains_line(fileObj, line) then return 0
-	return append_line(fileObj, line)
-end function
-
-split_fields = function(line)
-	if line == null then return []
-	return line.split("[|]")
-end function
-
-get_field = function(line, index, delimiter="[|]")
-	if line == null then return ""
-	parts = line.split(delimiter)
-	if parts.len <= index then return ""
-	return parts[index]
-end function
-
-// -----------------------------------------------------------------------
-// Argument helpers
-// -----------------------------------------------------------------------
-
-has_flag = function(flagName)
-	for p in params
-		if p == flagName then return 1
-	end for
-	return 0
-end function
-
-restart_command = function()
-	cmd = globals.SCRIPT_COMMAND
-
-	if cmd == null then cmd = globals.SCRIPT_NAME
-	if cmd == null then cmd = "unknown"
-
-	for p in params
-		cmd = cmd + " " + p
-	end for
-
-	return cmd
-end function
-
-// -----------------------------------------------------------------------
-// Logging helpers
-// -----------------------------------------------------------------------
-
-color_text = function(msg, color="white")
-	if color == "" then return msg
-	return "<color=" + color + ">" + msg + "</color>"
-end function
-
-print_log = function(msg, color="white")
-	print(color_text(msg, color))
-end function
-
-log_event = function(msg, color="white")
-	if globals.runLog != null then append_line(globals.runLog, current_date + "|" + msg)
-	print_log(msg, color)
-end function
-
-// -----------------------------------------------------------------------
-// Heartbeat state writer
-// -----------------------------------------------------------------------
-// Caller globals expected:
-//   SCRIPT_NAME
-//   SCRIPT_VERSION
-//   SCRIPT_BLD
-//   scanner_name
-//   stateFile
-//
-// Caller globals optional:
-//   state_grace
-//
-// State format:
-//   scanner|online_state|activity|wait_seconds|last_beat|expires_at|script_version|script_bld|lib_version|lib_bld|detail
-// -----------------------------------------------------------------------
-
-state_expires = function(waitSeconds)
-	grace = 3
-	if globals.state_grace != null then grace = globals.state_grace
-	return time + waitSeconds + grace
-end function
-
-log_state = function(activity, waitSeconds, detail="")
-	if globals.stateFile == null then return 0
-
-	now = time
-	expiresAt = state_expires(waitSeconds)
-	onlineState = "ONLINE"
-
-	if activity == "OFFLINE" then
-		onlineState = "OFFLINE"
-		expiresAt = now
-	end if
-
-	if activity == "ERROR" then
-		onlineState = "OFFLINE"
-		expiresAt = now
-	end if
-
-	if activity == "UPDATE_REQUIRED" then
-		onlineState = "OFFLINE"
-		expiresAt = now
-	end if
-
-	scriptVersion = globals.SCRIPT_VERSION
-	if scriptVersion == null then scriptVersion = "0.0.0"
-
-	scriptBld = globals.SCRIPT_BLD
-	if scriptBld == null then scriptBld = 0
-
-	line = globals.scanner_name + "|" + onlineState + "|" + activity + "|" + waitSeconds + "|" + now + "|" + expiresAt + "|" + scriptVersion + "|" + scriptBld + "|" + ANE3_LIB_VERSION + "|" + ANE3_LIB_BLD + "|" + detail
-	globals.stateFile.set_content(line)
-
-	return 1
-end function
-
-shutdown = function(message)
-	log_state("OFFLINE", 0, message)
-	exit(color_text(message, "white"))
-end function
-
-// -----------------------------------------------------------------------
-// Manifest lookup primitives
-// -----------------------------------------------------------------------
-// lib_functions does not own the manifest. Heartbeat owns and refreshes it.
-// These helpers only read a caller-provided manifest file.
-// Manifest format:
-//   type|name|version|bld|path|last_checked
-// -----------------------------------------------------------------------
-
-manifest_line = function(manifestFile, componentType, componentName)
-	content = safe_content(manifestFile)
-	lines = content.split(char(10))
-
-	prefix = componentType + "|" + componentName + "|"
-
+	lines = safe_content(fileObj).split(char(10))
 	for line in lines
-		if line.indexOf(prefix) == 0 then return line
+		if line.indexOf("ANE3_META|") != null then return line
 	end for
 
 	return ""
 end function
 
-manifest_version = function(manifestFile, componentType, componentName)
-	line = manifest_line(manifestFile, componentType, componentName)
-	if line == "" then return "UNKNOWN"
-	return get_field(line, 2)
+state_detail = function(stateLine)
+	if stateLine == "" then return "No state reported"
+
+	parts = split_fields(stateLine)
+	if parts.len <= 10 then return ""
+
+	detail = ""
+	for index in parts.indexes
+		if index >= 10 then
+			if detail != "" then detail = detail + "|"
+			detail = detail + parts[index]
+		end if
+	end for
+
+	return detail
 end function
 
-manifest_bld = function(manifestFile, componentType, componentName)
-	line = manifest_line(manifestFile, componentType, componentName)
-	if line == "" then return -1
-	return get_field(line, 3).to_int
+// -----------------------------------------------------------------------
+// Dynamic source manifest ownership
+// -----------------------------------------------------------------------
+
+source_manifest_line = function(fileObj)
+	if fileObj == null then return ""
+	if not ends_with(fileObj.name, ".src") then return ""
+
+	metaLine = source_meta_line(fileObj)
+	if metaLine == "" then return ""
+
+	componentType = meta_value(metaLine, "type", "")
+	componentName = meta_value(metaLine, "name", "")
+	version = meta_value(metaLine, "version", "")
+	lastVersion = meta_value(metaLine, "last_version", "")
+	lastBldText = meta_value(metaLine, "last_bld", "")
+
+	if componentType == "" then return ""
+	if componentName == "" then return ""
+	if version == "" then return ""
+	if lastVersion == "" then return ""
+	if lastBldText == "" then return ""
+
+	bld = calc_bld(version, lastVersion, lastBldText.to_int)
+	return componentType + "|" + componentName + "|" + version + "|" + bld + "|" + fileObj.path + "|" + time
+end function
+
+manifest_lines_from_folder = function(folderPath)
+	lines = []
+	folderObj = globals.computer.File(folderPath)
+
+	if folderObj == null then return lines
+	if not folderObj.is_folder then return lines
+
+	files = folderObj.get_files
+	for fileObj in files
+		line = source_manifest_line(fileObj)
+		if line != "" then lines.push(line)
+	end for
+
+	return lines
+end function
+
+refresh_manifest = function()
+	lines = []
+
+	for line in manifest_lines_from_folder(globals.srcPath)
+		lines.push(line)
+	end for
+
+	for line in manifest_lines_from_folder(globals.libPath)
+		lines.push(line)
+	end for
+
+	lines.sort
+	globals.manifestFile.set_content(lines.join(char(10)))
+	log_event("Heartbeat refreshed ane3.manifest from installed source metadata", "#999999")
+end function
+
+manifest_script_names = function()
+	names = []
+	lines = safe_content(globals.manifestFile).split(char(10))
+
+	for line in lines
+		if get_field(line, 0) == "script" then
+			name = get_field(line, 1)
+			if name != "" then names.push(name)
+		end if
+	end for
+
+	return names
+end function
+
+resolve_script_source = function(scannerId)
+	if scannerId == "" then return ["SOURCE_UNREGISTERED", ""]
+
+	exactLine = manifest_line(globals.manifestFile, "script", scannerId)
+	if exactLine != "" then return ["EXACT", scannerId]
+
+	matches = []
+	for sourceName in manifest_script_names()
+		if sourceName.indexOf(scannerId) == 0 then matches.push(sourceName)
+	end for
+
+	if matches.len == 1 then return ["PREFIX", matches[0]]
+	if matches.len > 1 then return ["SOURCE_AMBIGUOUS", ""]
+
+	return ["SOURCE_UNREGISTERED", ""]
 end function
 
 // -----------------------------------------------------------------------
-// Runtime policy helper
-// -----------------------------------------------------------------------
-// Caller decides when to call this, usually at safe loop boundaries.
-// This function returns policy; the active component owns its state report.
-// Policy:
-//   script/lib current       -> CURRENT
-//   script/lib 1 build old   -> UPDATE_AVAILABLE
-//   script/lib 2+ builds old -> UPDATE_REQUIRED exit
-//   missing manifest data    -> UNKNOWN, continue
+// Dynamic runtime-state discovery
 // -----------------------------------------------------------------------
 
-check_runtime_policy = function(manifestFile)
-	if manifestFile == null then return "UNKNOWN"
+state_file_names = function()
+	names = []
+	folderObj = globals.computer.File(globals.statesPath)
 
-	currentScriptBld = manifest_bld(manifestFile, "script", globals.SCRIPT_NAME)
-	currentLibBld = manifest_bld(manifestFile, "lib", ANE3_LIB_NAME)
+	if folderObj == null then return names
+	if not folderObj.is_folder then return names
 
-	if currentScriptBld < 0 then return "UNKNOWN"
-	if currentLibBld < 0 then return "UNKNOWN"
+	for fileObj in folderObj.get_files
+		fileName = fileObj.name
+		if starts_with(fileName, "state_") and ends_with(fileName, ".txt") then
+			if fileName != "state_heartbeat.txt" then names.push(fileName)
+		end if
+	end for
 
-	scriptDiff = currentScriptBld - globals.SCRIPT_BLD
-	libDiff = currentLibBld - ANE3_LIB_BLD
+	names.sort
+	return names
+end function
 
-	if scriptDiff >= 2 or libDiff >= 2 then
-		update_required_exit(manifestFile, scriptDiff, libDiff)
+state_record_valid = function(stateLine)
+	if stateLine == "" then return 0
+	parts = split_fields(stateLine)
+	if parts.len < 11 then return 0
+	if get_field(stateLine, 0).trim == "" then return 0
+	if get_field(stateLine, 1).trim == "" then return 0
+	if get_field(stateLine, 2).trim == "" then return 0
+	return 1
+end function
+
+state_observation_age = function(fileName, stateLine)
+	index = globals.observedStateFiles.indexOf(fileName)
+
+	if index == null then
+		globals.observedStateFiles.push(fileName)
+		globals.observedStateContent.push(stateLine)
+		globals.observedStateChangedAt.push(time)
+		return -1
 	end if
 
-	if scriptDiff == 1 or libDiff == 1 then
-		return "UPDATE_AVAILABLE"
+	if globals.observedStateContent[index] != stateLine then
+		globals.observedStateContent[index] = stateLine
+		globals.observedStateChangedAt[index] = time
+		return 0
 	end if
 
-	return "CURRENT"
+	return time - globals.observedStateChangedAt[index]
 end function
 
-update_required_exit = function(manifestFile, scriptDiff, libDiff)
-	currentScriptVersion = manifest_version(manifestFile, "script", globals.SCRIPT_NAME)
-	currentScriptBld = manifest_bld(manifestFile, "script", globals.SCRIPT_NAME)
-	currentLibVersion = manifest_version(manifestFile, "lib", ANE3_LIB_NAME)
-	currentLibBld = manifest_bld(manifestFile, "lib", ANE3_LIB_NAME)
+state_effective_activity = function(fileName, stateLine)
+	if stateLine == "" then return "NO_REPORT"
 
-	reason = ""
-	if scriptDiff >= 2 then reason = reason + "Script is " + scriptDiff + " builds behind. "
-	if libDiff >= 2 then reason = reason + "Shared library is " + libDiff + " builds behind. "
+	onlineState = get_field(stateLine, 1)
+	activity = get_field(stateLine, 2)
+	waitSeconds = get_field(stateLine, 3).to_int
 
-	msg = "ANE3 UPDATE REQUIRED" + char(10) + char(10)
-	msg = msg + globals.SCRIPT_NAME + " detected stale runtime code." + char(10)
-	msg = msg + "Detected: " + current_date + char(10) + char(10)
+	if onlineState == "OFFLINE" then return activity
 
-	msg = msg + "Loaded script: " + globals.SCRIPT_NAME + " v" + globals.SCRIPT_VERSION + " bld " + globals.SCRIPT_BLD + char(10)
-	msg = msg + "Current script: " + globals.SCRIPT_NAME + " v" + currentScriptVersion + " bld " + currentScriptBld + char(10)
+	leaseSeconds = waitSeconds + globals.state_grace
+	observedAge = state_observation_age(fileName, stateLine)
 
-	msg = msg + "Loaded lib: " + ANE3_LIB_NAME + " v" + ANE3_LIB_VERSION + " bld " + ANE3_LIB_BLD + char(10)
-	msg = msg + "Current lib: " + ANE3_LIB_NAME + " v" + currentLibVersion + " bld " + currentLibBld + char(10) + char(10)
+	if observedAge < 0 then return "VERIFYING"
+	if observedAge > leaseSeconds then return "STALE"
 
-	msg = msg + "Reason: " + reason + char(10)
-	msg = msg + "Stopping now to avoid writing outdated records." + char(10) + char(10)
-	msg = msg + "Relaunch command:" + char(10)
-	msg = msg + restart_command()
+	return activity
+end function
 
-	log_state("UPDATE_REQUIRED", 0, reason + " Relaunch: " + restart_command())
-	print(color_text(msg, "red"))
-	exit(color_text("ANE3 update required. Relaunch with: " + restart_command(), "red"))
+heartbeat_status_color = function(statusName)
+	if statusName == "INVALID_STATE" then return "red"
+	if statusName == "DUPLICATE_STATE" then return "red"
+	if statusName == "SOURCE_AMBIGUOUS" then return "yellow"
+	if statusName == "SOURCE_UNREGISTERED" then return "yellow"
+	if statusName == "VERIFYING" then return "yellow"
+	return activity_color(statusName)
+end function
+
+version_badge = function(label, runningVersion, runningBld, currentBld)
+	if runningVersion == "" then runningVersion = "UNKNOWN"
+	color = bld_color(currentBld, runningBld)
+	return label + " " + color_text(runningVersion + " bld " + runningBld, color)
+end function
+
+invalid_state_row = function(fileName, statusName, detail)
+	statusText = color_text(statusName, heartbeat_status_color(statusName))
+	print(fileName + " : " + statusText + " | script UNKNOWN | lib UNKNOWN | " + detail)
+end function
+
+state_row = function(fileName, stateLine)
+	scannerId = get_field(stateLine, 0).trim
+	if scannerId == "heartbeat" then return
+
+	activity = state_effective_activity(fileName, stateLine)
+	detail = state_detail(stateLine)
+
+	runningScriptVersion = get_field(stateLine, 6)
+	runningScriptBld = get_field(stateLine, 7).to_int
+	runningLibVersion = get_field(stateLine, 8)
+	runningLibBld = get_field(stateLine, 9).to_int
+
+	sourceMatch = resolve_script_source(scannerId)
+	sourceStatus = sourceMatch[0]
+	manifestName = sourceMatch[1]
+
+	// A state file may appear after Heartbeat's cached manifest was built.
+	// Newly observed ONLINE registrations receive one immediate source refresh
+	// before SOURCE_UNREGISTERED is reported.
+	if sourceStatus == "SOURCE_UNREGISTERED" and activity == "VERIFYING" then
+		refresh_manifest()
+		sourceMatch = resolve_script_source(scannerId)
+		sourceStatus = sourceMatch[0]
+		manifestName = sourceMatch[1]
+	end if
+
+	currentScriptBld = -1
+	if manifestName != "" then
+		currentScriptBld = manifest_bld(globals.manifestFile, "script", manifestName)
+	end if
+
+	currentLibBld = manifest_bld(globals.manifestFile, "lib", "lib_functions")
+
+	statusText = color_text(activity, heartbeat_status_color(activity))
+	scriptText = version_badge("script", runningScriptVersion, runningScriptBld, currentScriptBld)
+	libText = version_badge("lib", runningLibVersion, runningLibBld, currentLibBld)
+
+	sourceText = ""
+	if sourceStatus == "EXACT" or sourceStatus == "PREFIX" then
+		sourceLabel = manifestName
+		if sourceStatus == "PREFIX" then sourceLabel = sourceLabel + " (prefix)"
+		sourceText = " | source " + color_text(sourceLabel, "#999999")
+	else if sourceStatus == "SOURCE_AMBIGUOUS" or sourceStatus == "SOURCE_UNREGISTERED" then
+		sourceText = " | " + color_text(sourceStatus, heartbeat_status_color(sourceStatus))
+	end if
+
+	print(scannerId + " : " + statusText + " | " + scriptText + " | " + libText + sourceText + " | " + detail)
 end function
 
 // -----------------------------------------------------------------------
-// Color helpers for Heartbeat display
+// Dashboard display
 // -----------------------------------------------------------------------
 
-activity_color = function(activity)
-	if activity == "ACTIVE" then return "green"
-	if activity == "IDLE" then return "#4da6ff"
-	if activity == "STALE" then return "yellow"
-	if activity == "UPDATE_AVAILABLE" then return "yellow"
-	if activity == "UPDATE_REQUIRED" then return "red"
-	if activity == "OFFLINE" then return "red"
-	if activity == "ERROR" then return "red"
-	return "#999999"
+draw_header = function(registrationCount)
+	print("")
+	print(color_text("ANE3 HEARTBEAT", "#4da6ff"))
+	print(color_text("--------------", "#4da6ff"))
+	print("heartbeat v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + " | lib_functions v" + ANE3_LIB_VERSION + " bld " + ANE3_LIB_BLD)
+	print("runtime registrations: " + registrationCount + " | manifest refresh: " + manifest_refresh_interval + "s | poll: " + state_poll_interval + "s")
+	print("")
 end function
 
-bld_color = function(currentBld, runningBld)
-	if currentBld < 0 then return "#999999"
-	if runningBld < 0 then return "#999999"
-
-	diff = currentBld - runningBld
-
-	if diff == 0 then return "green"
-	if diff == 1 then return "yellow"
-	if diff >= 2 then return "red"
-
-	// Running build is newer than the registered source build.
-	return "yellow"
+draw_legend = function()
+	print("")
+	print(color_text("ACTIVE", "green") + " working | " + color_text("IDLE", "#4da6ff") + " waiting | " + color_text("VERIFYING", "yellow") + " awaiting first renewal")
+	print(color_text("STALE", "yellow") + " missed lease | " + color_text("OFFLINE", "red") + " stopped")
+	print(color_text("SOURCE_UNREGISTERED", "yellow") + " runtime has no source match | " + color_text("SOURCE_AMBIGUOUS", "yellow") + " multiple source matches")
+	print(color_text("INVALID_STATE", "red") + " malformed registration | " + color_text("DUPLICATE_STATE", "red") + " repeated scanner identity")
+	print("")
 end function
+
+draw_dashboard = function()
+	fileNames = state_file_names()
+	clear_screen()
+	draw_header(fileNames.len)
+
+	seenScannerIds = []
+
+	for fileName in fileNames
+		stateObj = globals.computer.File(globals.statesPath + "/" + fileName)
+		if stateObj == null then
+			invalid_state_row(fileName, "INVALID_STATE", "State file disappeared during refresh")
+			continue
+		end if
+
+		stateLine = safe_content(stateObj)
+		if not state_record_valid(stateLine) then
+			invalid_state_row(fileName, "INVALID_STATE", "Expected the ANE3 runtime state schema")
+			continue
+		end if
+
+		scannerId = get_field(stateLine, 0).trim
+		if scannerId == "heartbeat" then continue
+
+		if seenScannerIds.indexOf(scannerId) != null then
+			invalid_state_row(fileName, "DUPLICATE_STATE", "Scanner identity already registered: " + scannerId)
+			continue
+		end if
+
+		seenScannerIds.push(scannerId)
+		state_row(fileName, stateLine)
+	end for
+
+	if seenScannerIds.len == 0 then
+		print(color_text("No operational components have registered state yet.", "#999999"))
+	end if
+
+	draw_legend()
+end function
+
+// -----------------------------------------------------------------------
+// Main loop
+// -----------------------------------------------------------------------
+
+log_event("Heartbeat v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + " starting with observed lease validation", "#4da6ff")
+refresh_manifest()
+
+nextManifestRefresh = time + manifest_refresh_interval
+
+while 1
+	if time >= nextManifestRefresh then
+		refresh_manifest()
+		nextManifestRefresh = time + manifest_refresh_interval
+	end if
+
+	runtimePolicy = check_runtime_policy(manifestFile)
+
+	if runtimePolicy == "UPDATE_AVAILABLE" then
+		log_state("UPDATE_AVAILABLE", state_poll_interval, "Update available. Redeploy Heartbeat.")
+	else
+		log_state("ACTIVE", state_poll_interval, "Discovering ANE3 runtime registrations")
+	end if
+
+	draw_dashboard()
+	wait(state_poll_interval)
+end while
