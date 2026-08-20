@@ -1,0 +1,55 @@
+shell = get_shell()
+comp = shell.host_computer
+
+collect_pid = function(command)
+	output = []
+	datarow = comp.show_procs.split(char(10))
+	for r in datarow
+		c = r.split(" ")
+		if c[4] == command then
+			output.push(c[1])
+		end if	
+	end for
+	return output
+end function
+
+difference = function(after, before)
+	output = []
+	for t in after
+		if before.indexOf(t) == null then
+			output.push(t)
+		end if
+	end for
+	return output
+end function
+
+	
+
+//1. Collect tPID information before the script is launched
+tPID_before = collect_pid("Terminal")
+// Ex: [41, 57]
+
+shell.launch("/usr/bin/Terminal.exe","/bin/missionscan1")
+wait(1)
+
+//2. Collect tPID info after the script is launched
+tPID_after = collect_pid("Terminal")
+// Ex: [41, 57, 73]
+
+//3. Compare the two datasets for an outlier in the new (after) data
+tPID_diff = difference(tPID_after, tPID_before)
+// Ex: [73]
+
+if tPID_diff.len == 1 then
+	print("Terminal PID found: " + tPID_diff[0])
+	comp.close_program(tPID_diff[0].to_int)
+else if tPID_diff.len > 1 then
+	print("Multiple new terminals found. Termination aborted.")
+else 
+	print("No new terminals were detected.")
+end if
+
+//proc = comp.show_procs().split(char(10))
+//last_proc = proc[proc.len-1].split(" ")
+//proc_id = last_proc[1].to_int
+//comp.close_program(proc_id)
