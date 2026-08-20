@@ -1,0 +1,869 @@
+// =======================================================================
+// ANE3 MAPSCAN 3 (mapscan3.src)
+// Record-ready v0.1.14 bld 1014
+// -----------------------------------------------------------------------
+// Mission-agnostic target/service mapper with target-intelligence freshness.
+//
+// Scheduler priority:
+//   1. Explicit/direct target requests written to target-seeds.db
+//   2. Other queued target seeds
+//   3. Oldest stale target eligible for refresh
+//   4. Idle dashboard / countdown
+//
+// Target freshness uses parsed in-game date/time from current_date. The
+// numeric time value is process-local and is used only for short state leases.
+//
+// Current target reports:
+//   /ANE3/TARGETS/<ip>.txt
+//
+// Superseded successful reports:
+//   /ANE3/TARGETS/ARCHIVE/<ip>/scan-rNNNN-t<game-minute>.txt
+//   Archive behavior: enabled
+//
+// A stale report remains authoritative until a successful replacement exists.
+// Failed refreshes preserve the last known-good report and service snapshot.
+// =======================================================================
+
+// ANE3_META|type=script|name=mapscan3|version=0.1.14|last_version=0.1.13|last_bld=1013
+
+SCRIPT_NAME = "mapscan3"
+SCRIPT_COMMAND = "mapscan3"
+SCRIPT_VERSION = "0.1.14"
+SCRIPT_LAST_VERSION = "0.1.13"
+SCRIPT_LAST_BLD = 1013
+
+shell = get_shell
+computer = shell.host_computer
+
+import_code("/home/Archeagus/ANE3/SRC/LIB/lib_functions.src")
+
+SCRIPT_BLD = calc_bld(SCRIPT_VERSION, SCRIPT_LAST_VERSION, SCRIPT_LAST_BLD)
+
+scanner_name = "mapscan"
+state_grace = 3
+active_lease = 15
+scheduler_poll_seconds = 10
+
+// Persistent in-game freshness policy. Values are in in-game minutes.
+target_max_age_minutes = 1440
+retry_backoff_minutes = 60
+
+manifestFile = globals.computer.File(ane_path("MANIFEST") + "/ane3.manifest")
+runLog = globals.computer.File(ane_path("LOG") + "/run.log")
+stateFile = init_file("state_mapscan.txt", "STATES")
+
+metax = include_lib("/lib/metaxploit.so")
+if not metax then
+	log_state("ERROR", 0, "Unable to find /lib/metaxploit.so")
+	exit("<color=red>Error: Unable to find /lib/metaxploit.so</color>")
+end if
+
+// -----------------------------------------------------------------------
+// Shared-file and state helpers
+// -----------------------------------------------------------------------
+
+refresh_shared_files = function()
+	if globals.manifestFile == null then
+		globals.manifestFile = globals.computer.File(ane_path("MANIFEST") + "/ane3.manifest")
+	end if
+
+	if globals.runLog == null then
+		globals.runLog = globals.computer.File(ane_path("LOG") + "/run.log")
+	end if
+end function
+
+report_state = function(activity, leaseSeconds, detail="")
+	refresh_shared_files()
+	runtimePolicy = check_runtime_policy(globals.manifestFile)
+
+	if runtimePolicy == "UPDATE_AVAILABLE" then
+		log_state("UPDATE_AVAILABLE", leaseSeconds, detail + " | redeploy recommended")
+	else
+		log_state(activity, leaseSeconds, detail)
+	end if
+
+	return runtimePolicy
+end function
+
+// -----------------------------------------------------------------------
+// Persistent in-game clock
+// -----------------------------------------------------------------------
+
+month_number = function(monthName)
+	name = monthName.lower
+	if name == "jan" then return 1
+	if name == "feb" then return 2
+	if name == "mar" then return 3
+	if name == "apr" then return 4
+	if name == "may" then return 5
+	if name == "jun" then return 6
+	if name == "jul" then return 7
+	if name == "aug" then return 8
+	if name == "sep" then return 9
+	if name == "oct" then return 10
+	if name == "nov" then return 11
+	if name == "dec" then return 12
+	return 0
+end function
+
+is_leap_year = function(year)
+	if year % 400 == 0 then return 1
+	if year % 100 == 0 then return 0
+	if year % 4 == 0 then return 1
+	return 0
+end function
+
+days_before_year = function(year)
+	previousYear = year - 1
+	return (previousYear * 365) + floor(previousYear / 4) - floor(previousYear / 100) + floor(previousYear / 400)
+end function
+
+days_before_month = function(year, monthNumber)
+	monthOffsets = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+	if monthNumber < 1 or monthNumber > 12 then return -1
+
+	days = monthOffsets[monthNumber - 1]
+	if monthNumber > 2 and is_leap_year(year) then days = days + 1
+	return days
+end function
+
+game_minute_from_date = function(dateText)
+	dateTimeParts = dateText.split(" - ")
+	if dateTimeParts.len < 2 then return -1
+
+	datePartText = dateTimeParts[0].trim
+	clockPartText = dateTimeParts[1].trim
+	dateParts = datePartText.split("/")
+	clockParts = clockPartText.split("[:]")
+	if dateParts.len < 3 or clockParts.len < 2 then return -1
+
+	day = dateParts[0].to_int
+	month = month_number(dateParts[1])
+	year = dateParts[2].to_int
+	hour = clockParts[0].to_int
+	minute = clockParts[1].to_int
+
+	if day < 1 or month == 0 or year < 1 then return -1
+	if hour < 0 or hour > 23 or minute < 0 or minute > 59 then return -1
+
+	monthDays = days_before_month(year, month)
+	if monthDays < 0 then return -1
+
+	absoluteDays = days_before_year(year) + monthDays + day - 1
+	return (absoluteDays * 1440) + (hour * 60) + minute
+end function
+
+current_game_minute = function()
+	return game_minute_from_date(current_date)
+end function
+
+format_wait_minutes = function(minutesValue)
+	if minutesValue <= 0 then return "DUE NOW"
+
+	days = floor(minutesValue / 1440)
+	remainder = minutesValue % 1440
+	hours = floor(remainder / 60)
+	minutes = remainder % 60
+
+	text = ""
+	if days > 0 then text = text + days + "d "
+	if hours > 0 or days > 0 then text = text + hours + "h "
+	text = text + minutes + "m"
+	return text
+end function
+
+pad_number = function(value, width)
+	text = "" + value
+	while text.len < width
+		text = "0" + text
+	end while
+	return text
+end function
+
+// -----------------------------------------------------------------------
+// Local filesystem helpers
+// -----------------------------------------------------------------------
+
+ensure_child_folder = function(parentPath, folderName)
+	path = parentPath + "/" + folderName
+	folderObj = globals.computer.File(path)
+	if folderObj != null then return path
+
+	createResult = globals.computer.create_folder(parentPath, folderName)
+	if createResult != 1 then
+		log_event("Unable to create folder " + path, "red")
+		return ""
+	end if
+
+	return path
+end function
+
+touch_file_at = function(folderPath, fileName)
+	filePath = folderPath + "/" + fileName
+	fileObj = globals.computer.File(filePath)
+	if fileObj != null then return fileObj
+
+	touchResult = globals.computer.touch(folderPath, fileName)
+	if touchResult != 1 then return null
+	return globals.computer.File(filePath)
+end function
+
+set_content_checked = function(fileObj, content, context)
+	if fileObj == null then
+		log_event("Missing file while writing " + context, "red")
+		return 0
+	end if
+
+	result = fileObj.set_content(content)
+	if result == 1 then return 1
+
+	log_event("Unable to write " + context + ": " + result, "red")
+	return 0
+end function
+
+// -----------------------------------------------------------------------
+// Line-oriented database helpers
+// -----------------------------------------------------------------------
+
+upsert_line = function(fileObj, keyValue, keyIndex, newLine)
+	lines = safe_content(fileObj).split(char(10))
+	outputLines = []
+	found = 0
+
+	for line in lines
+		if line == "" then continue
+		if line.indexOf("#") == 0 then
+			outputLines.push(line)
+			continue
+		end if
+
+		parts = split_fields(line)
+		if parts.len > keyIndex and parts[keyIndex] == keyValue then
+			if not found then outputLines.push(newLine)
+			found = 1
+		else
+			outputLines.push(line)
+		end if
+	end for
+
+	if not found then outputLines.push(newLine)
+	return set_content_checked(fileObj, outputLines.join(char(10)), "database upsert")
+end function
+
+replace_line_at = function(fileObj, lineIndex, newLine)
+	lines = safe_content(fileObj).split(char(10))
+	outputLines = []
+
+	for index in lines.indexes
+		line = lines[index]
+		if line == "" then continue
+		if index == lineIndex then
+			outputLines.push(newLine)
+		else
+			outputLines.push(line)
+		end if
+	end for
+
+	return set_content_checked(fileObj, outputLines.join(char(10)), "queue status")
+end function
+
+replace_target_services = function(ipAddress, serviceLines)
+	lines = safe_content(globals.servicesDb).split(char(10))
+	outputLines = []
+
+	for line in lines
+		if line == "" then continue
+		if line.indexOf("#") == 0 then
+			outputLines.push(line)
+			continue
+		end if
+
+		parts = split_fields(line)
+		if parts.len > 0 and parts[0] == ipAddress then continue
+		outputLines.push(line)
+	end for
+
+	for serviceLine in serviceLines
+		outputLines.push(serviceLine)
+	end for
+
+	return set_content_checked(globals.servicesDb, outputLines.join(char(10)), "services snapshot for " + ipAddress)
+end function
+
+// -----------------------------------------------------------------------
+// Target record helpers
+// targets.db:
+// ip|revision|last_source|last_source_ref|last_result|last_success_minute|
+// last_success_date|last_attempt_minute|last_attempt_date|successful_scans|
+// failed_scans|last_error
+// -----------------------------------------------------------------------
+
+target_record = function(ipAddress)
+	lines = safe_content(globals.targetsDb).split(char(10))
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len > 0 and parts[0] == ipAddress then return line
+	end for
+	return ""
+end function
+
+target_number = function(recordLine, fieldIndex, defaultValue)
+	if recordLine == "" then return defaultValue
+	parts = split_fields(recordLine)
+	if parts.len <= fieldIndex then return defaultValue
+	if parts[fieldIndex] == "" then return defaultValue
+	return parts[fieldIndex].to_int
+end function
+
+target_is_fresh = function(recordLine, nowMinute)
+	lastSuccess = target_number(recordLine, 5, -1)
+	if lastSuccess < 0 then return 0
+	return nowMinute - lastSuccess < globals.target_max_age_minutes
+end function
+
+target_retry_eligible = function(recordLine, nowMinute)
+	lastAttempt = target_number(recordLine, 7, -1)
+	if lastAttempt < 0 then return 1
+	return nowMinute - lastAttempt >= globals.retry_backoff_minutes
+end function
+
+record_failed_attempt = function(ipAddress, sourceName, sourceRef, resultName, errorText)
+	nowMinute = current_game_minute()
+	nowDate = current_date
+	existing = target_record(ipAddress)
+
+	revision = target_number(existing, 1, 0)
+	lastSuccessMinute = target_number(existing, 5, -1)
+	lastSuccessDate = ""
+	successfulScans = target_number(existing, 9, 0)
+	failedScans = target_number(existing, 10, 0) + 1
+
+	if existing != "" then lastSuccessDate = get_field(existing, 6)
+
+	cleanError = errorText.replace("[|]", "/")
+	cleanError = cleanError.replace(char(10), " ")
+	newLine = ipAddress + "|" + revision + "|" + sourceName + "|" + sourceRef + "|" + resultName + "|" + lastSuccessMinute + "|" + lastSuccessDate + "|" + nowMinute + "|" + nowDate + "|" + successfulScans + "|" + failedScans + "|" + cleanError
+	return upsert_line(globals.targetsDb, ipAddress, 0, newLine)
+end function
+
+// -----------------------------------------------------------------------
+// Target-seed queue
+// target-seeds.db:
+// ip|source|source_ref|request_mode|status|created|updated|notes
+// -----------------------------------------------------------------------
+
+queue_direct_target = function(ipAddress, forceMode)
+	requestMode = "NORMAL"
+	if forceMode then requestMode = "FORCE"
+
+	sourceRef = "CLI-" + current_date + "-" + time
+	line = ipAddress + "|DIRECT|" + sourceRef + "|" + requestMode + "|QUEUED|" + current_date + "|" + current_date + "|"
+	return append_line(globals.targetSeeds, line)
+end function
+
+next_seed = function()
+	lines = safe_content(globals.targetSeeds).split(char(10))
+
+	for index in lines.indexes
+		line = lines[index]
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len < 5 then continue
+		if parts[4] != "QUEUED" then continue
+		if not is_valid_ip(parts[0]) then continue
+
+		sourceRef = ""
+		requestMode = "NORMAL"
+		if parts.len > 2 then sourceRef = parts[2]
+		if parts.len > 3 then requestMode = parts[3]
+		return [index, parts[0], parts[1], sourceRef, requestMode]
+	end for
+
+	return []
+end function
+
+mark_seed = function(seedInfo, statusName, notesText)
+	if seedInfo.len == 0 then return 1
+
+	lines = safe_content(globals.targetSeeds).split(char(10))
+	lineIndex = seedInfo[0]
+	if lineIndex < 0 or lineIndex >= lines.len then return 0
+
+	parts = split_fields(lines[lineIndex])
+	if parts.len < 5 then return 0
+
+	created = current_date
+	if parts.len > 5 then created = parts[5]
+	newLine = parts[0] + "|" + parts[1] + "|" + parts[2] + "|" + parts[3] + "|" + statusName + "|" + created + "|" + current_date + "|" + notesText
+	return replace_line_at(globals.targetSeeds, lineIndex, newLine)
+end function
+
+// -----------------------------------------------------------------------
+// Freshness scheduler
+// -----------------------------------------------------------------------
+
+oldest_due_target = function(nowMinute)
+	lines = safe_content(globals.targetsDb).split(char(10))
+	selectedIp = ""
+	selectedSuccess = 999999999999
+
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len < 8 then continue
+
+		ipAddress = parts[0]
+		if not is_valid_ip(ipAddress) then continue
+		if target_is_fresh(line, nowMinute) then continue
+		if not target_retry_eligible(line, nowMinute) then continue
+
+		lastSuccess = target_number(line, 5, -1)
+		sortValue = lastSuccess
+		if sortValue < 0 then sortValue = -1
+
+		if selectedIp == "" or sortValue < selectedSuccess then
+			selectedIp = ipAddress
+			selectedSuccess = sortValue
+		end if
+	end for
+
+	return selectedIp
+end function
+
+target_summary = function(nowMinute)
+	known = 0
+	fresh = 0
+	stale = 0
+	retryHold = 0
+	nextIp = ""
+	nextDue = 999999999999
+	nextReason = "NONE"
+
+	lines = safe_content(globals.targetsDb).split(char(10))
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len < 8 then continue
+
+		ipAddress = parts[0]
+		if not is_valid_ip(ipAddress) then continue
+		known = known + 1
+
+		lastSuccess = target_number(line, 5, -1)
+		lastAttempt = target_number(line, 7, -1)
+
+		if target_is_fresh(line, nowMinute) then
+			fresh = fresh + 1
+			dueAt = lastSuccess + globals.target_max_age_minutes
+			reason = "FRESHNESS"
+		else
+			stale = stale + 1
+			if target_retry_eligible(line, nowMinute) then
+				dueAt = nowMinute
+				reason = "OVERDUE"
+			else
+				retryHold = retryHold + 1
+				dueAt = lastAttempt + globals.retry_backoff_minutes
+				reason = "RETRY"
+			end if
+		end if
+
+		if nextIp == "" or dueAt < nextDue then
+			nextIp = ipAddress
+			nextDue = dueAt
+			nextReason = reason
+		end if
+	end for
+
+	return [known, fresh, stale, retryHold, nextIp, nextDue, nextReason]
+end function
+
+queued_seed_count = function()
+	count = 0
+	lines = safe_content(globals.targetSeeds).split(char(10))
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len > 4 and parts[4] == "QUEUED" then count = count + 1
+	end for
+	return count
+end function
+
+// -----------------------------------------------------------------------
+// Current report archive
+// -----------------------------------------------------------------------
+
+archive_current_report = function(ipAddress, oldRevision, oldSuccessMinute)
+	if oldRevision <= 0 then return 1
+
+	currentPath = ane_path("TARGETS") + "/" + ipAddress + ".txt"
+	currentFile = globals.computer.File(currentPath)
+	if currentFile == null then return 1
+
+	currentContent = safe_content(currentFile)
+	if currentContent == "" then return 1
+
+	archiveRoot = ensure_child_folder(ane_path("TARGETS"), "ARCHIVE")
+	if archiveRoot == "" then return 0
+
+	ipArchivePath = ensure_child_folder(archiveRoot, ipAddress)
+	if ipArchivePath == "" then return 0
+
+	archiveName = "scan-r" + pad_number(oldRevision, 4) + "-t" + oldSuccessMinute + ".txt"
+	archiveFile = touch_file_at(ipArchivePath, archiveName)
+	if archiveFile == null then return 0
+
+	writeResult = archiveFile.set_content(currentContent)
+	if writeResult != 1 then
+		log_event("Unable to archive target report for " + ipAddress + ": " + writeResult, "red")
+		return 0
+	end if
+
+	return 1
+end function
+
+// -----------------------------------------------------------------------
+// Library queue upsert
+// libraries.db format retained for LibScan 1 compatibility:
+// lib_key|lib_name|version|sample_ip|sample_port|status|last_seen
+// -----------------------------------------------------------------------
+
+upsert_library_observation = function(libKey, libName, libVersion, ipAddress, portNumber)
+	existing = ""
+	lines = safe_content(globals.librariesDb).split(char(10))
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len > 0 and parts[0] == libKey then
+			existing = line
+			break
+		end if
+	end for
+
+	statusName = "new"
+	if existing != "" then
+		statusName = get_field(existing, 5)
+		if statusName == "" then statusName = "new"
+	end if
+
+	newLine = libKey + "|" + libName + "|" + libVersion + "|" + ipAddress + "|" + portNumber + "|" + statusName + "|" + current_date
+	return upsert_line(globals.librariesDb, libKey, 0, newLine)
+end function
+
+// -----------------------------------------------------------------------
+// Target scan and successful-snapshot commit
+// -----------------------------------------------------------------------
+
+scan_target = function(ipAddress, sourceName, sourceRef)
+	if not is_valid_ip(ipAddress) then
+		log_event("Invalid IP skipped: " + ipAddress, "yellow")
+		return 0
+	end if
+
+	if not globals.computer.is_network_active then
+		record_failed_attempt(ipAddress, sourceName, sourceRef, "NO_NETWORK", "No internet access")
+		log_state("ERROR", 0, "No internet access")
+		exit("<color=red>MapScan3: No internet access.</color>")
+	end if
+
+	originalIp = ipAddress
+	if ipAddress == "127.0.0.1" then ipAddress = globals.computer.local_ip
+	isLanIp = is_lan_ip(ipAddress)
+
+	report_state("ACTIVE", active_lease, "Resolving target " + ipAddress)
+
+	if isLanIp then
+		router = get_router
+	else
+		router = get_router(ipAddress)
+	end if
+
+	if router == null then
+		errorText = "Router not found"
+		log_event(errorText + " for " + ipAddress, "yellow")
+		record_failed_attempt(ipAddress, sourceName, sourceRef, "NOT_FOUND", errorText)
+		return 0
+	end if
+
+	if isLanIp then
+		ports = router.device_ports(ipAddress)
+	else
+		ports = router.used_ports
+	end if
+
+	if ports == null then
+		errorText = "No port object returned"
+		log_event(errorText + " for " + ipAddress, "yellow")
+		record_failed_attempt(ipAddress, sourceName, sourceRef, "NO_PORT_OBJECT", errorText)
+		return 0
+	end if
+
+	if typeof(ports) == "string" then
+		errorText = "Port scan error: " + ports
+		log_event(errorText + " for " + ipAddress, "yellow")
+		record_failed_attempt(ipAddress, sourceName, sourceRef, "PORT_ERROR", errorText)
+		return 0
+	end if
+
+	existing = target_record(ipAddress)
+	oldRevision = target_number(existing, 1, 0)
+	oldSuccessMinute = target_number(existing, 5, -1)
+	newRevision = oldRevision + 1
+	nowMinute = current_game_minute()
+	nowDate = current_date
+
+	if nowMinute < 0 then
+		errorText = "Unable to parse current_date for persistent freshness"
+		log_event(errorText, "red")
+		record_failed_attempt(ipAddress, sourceName, sourceRef, "CLOCK_ERROR", errorText)
+		return 0
+	end if
+
+	clear_screen()
+	print_log("[+] MapScan3 v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + " - Target Intelligence Mapper", "white")
+	print_log("[+] Embedded runtime: lib_functions v" + ANE3_LIB_VERSION + " bld " + ANE3_LIB_BLD, "white")
+	print_log("[+] Target: " + originalIp, "white")
+	print_log("[+] Revision: " + newRevision, "white")
+	print_log("[+] Time: " + nowDate, "white")
+	print_log("[+] Source: " + sourceName, "white")
+	if sourceRef != "" then print_log("[+] Source reference: " + sourceRef, "white")
+
+	info = "PORT STATE SERVICE LAN LIBRARY"
+	infoLength = info.len
+	serviceLines = []
+	libraryObservations = []
+
+	for port in ports
+		report_state("ACTIVE", active_lease, "Scanning " + ipAddress + " port " + port.port_number)
+
+		serviceInfo = router.port_info(port)
+		lanIps = port.get_lan_ip
+		portStatus = "open"
+		if port.is_closed and not isLanIp then portStatus = "closed"
+
+		libKey = "unknown"
+		if port.is_closed == false then
+			netSession = metax.net_use(ipAddress, port.port_number)
+			if netSession then
+				metaLib = netSession.dump_lib
+				libKey = metaLib.lib_name + "-v" + metaLib.version
+				libraryObservations.push(libKey + "|" + metaLib.lib_name + "|" + metaLib.version + "|" + port.port_number)
+			end if
+		end if
+
+		newEntry = port.port_number + " " + portStatus + " " + serviceInfo + " " + lanIps + " " + libKey
+		if infoLength < newEntry.len then infoLength = newEntry.len
+		info = info + char(10) + newEntry
+
+		serviceLine = ipAddress + "|" + newRevision + "|" + port.port_number + "|" + portStatus + "|" + serviceInfo + "|" + lanIps + "|" + libKey + "|" + nowMinute + "|" + nowDate
+		serviceLines.push(serviceLine)
+	end for
+
+	dashes = ""
+	for c in range(1, infoLength + 8)
+		dashes = dashes + "-"
+	end for
+
+	formattedInfo = format_columns(info)
+	print(dashes)
+	print(formattedInfo)
+	print(dashes)
+
+	output = "[+] MapScan3 v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + char(10)
+	output = output + "[+] Embedded runtime: lib_functions v" + ANE3_LIB_VERSION + " bld " + ANE3_LIB_BLD + char(10)
+	output = output + "[+] Target: " + originalIp + char(10)
+	output = output + "[+] Revision: " + newRevision + char(10)
+	output = output + "[+] Time: " + nowDate + char(10)
+	output = output + "[+] Game minute: " + nowMinute + char(10)
+	output = output + "[+] Source: " + sourceName + char(10)
+	if sourceRef != "" then output = output + "[+] Source reference: " + sourceRef + char(10)
+	output = output + char(10) + dashes + char(10) + formattedInfo + char(10) + dashes + char(10)
+
+	if not archive_current_report(ipAddress, oldRevision, oldSuccessMinute) then
+		record_failed_attempt(ipAddress, sourceName, sourceRef, "ARCHIVE_ERROR", "Unable to preserve prior report")
+		return 0
+	end if
+
+	targetFile = touch_file_at(ane_path("TARGETS"), ipAddress + ".txt")
+	if not set_content_checked(targetFile, output, "target report for " + ipAddress) then
+		record_failed_attempt(ipAddress, sourceName, sourceRef, "REPORT_WRITE_ERROR", "Unable to write target report")
+		return 0
+	end if
+
+	if not replace_target_services(ipAddress, serviceLines) then
+		record_failed_attempt(ipAddress, sourceName, sourceRef, "SERVICE_WRITE_ERROR", "Unable to replace service snapshot")
+		return 0
+	end if
+
+	for observation in libraryObservations
+		parts = split_fields(observation)
+		if parts.len >= 4 then
+			upsert_library_observation(parts[0], parts[1], parts[2], ipAddress, parts[3])
+		end if
+	end for
+
+	successfulScans = target_number(existing, 9, 0) + 1
+	failedScans = target_number(existing, 10, 0)
+	newTargetLine = ipAddress + "|" + newRevision + "|" + sourceName + "|" + sourceRef + "|SCANNED|" + nowMinute + "|" + nowDate + "|" + nowMinute + "|" + nowDate + "|" + successfulScans + "|" + failedScans + "|"
+
+	if not upsert_line(globals.targetsDb, ipAddress, 0, newTargetLine) then return 0
+
+	log_event("MapScan completed for " + ipAddress + "; revision " + newRevision + " is authoritative", "white")
+	return 1
+end function
+
+// -----------------------------------------------------------------------
+// Idle dashboard
+// -----------------------------------------------------------------------
+
+draw_idle_dashboard = function()
+	nowMinute = current_game_minute()
+	summary = target_summary(nowMinute)
+	queued = queued_seed_count()
+
+	clear_screen()
+	print_log("ANE3 MAPSCAN 3", "#4da6ff")
+	print_log("--------------", "#4da6ff")
+	print_log("mapscan3 v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + " | lib_functions v" + ANE3_LIB_VERSION + " bld " + ANE3_LIB_BLD, "white")
+	print_log("", "white")
+	print_log("State: IDLE", "white")
+	print_log("Queued targets: " + queued, "white")
+	print_log("Known targets:  " + summary[0], "white")
+	print_log("Fresh targets:  " + summary[1], "white")
+	print_log("Stale targets:  " + summary[2], "white")
+	print_log("Retry hold:     " + summary[3], "white")
+	print_log("", "white")
+
+	if summary[4] == "" then
+		print_log("Next refresh: none", "white")
+	else
+		waitMinutes = summary[5] - nowMinute
+		print_log("Next target:    " + summary[4], "white")
+		print_log("Next reason:    " + summary[6], "white")
+		print_log("Due in:         " + format_wait_minutes(waitMinutes), "white")
+	end if
+
+	print_log("", "white")
+	print_log("Target max age: " + format_wait_minutes(target_max_age_minutes), "white")
+	print_log("Retry backoff:  " + format_wait_minutes(retry_backoff_minutes), "white")
+end function
+
+idle_state_detail = function()
+	nowMinute = current_game_minute()
+	summary = target_summary(nowMinute)
+	if summary[4] == "" then return "Idle; no known target refresh scheduled"
+	return "Idle; next " + summary[6] + " target " + summary[4] + " in " + format_wait_minutes(summary[5] - nowMinute)
+end function
+
+// -----------------------------------------------------------------------
+// Bootstrap current schemas
+// -----------------------------------------------------------------------
+
+targetSeeds = init_file("target-seeds.db", "DB", "# ip|source|source_ref|request_mode|status|created|updated|notes")
+targetsDb = init_file("targets.db", "DB", "# ip|revision|last_source|last_source_ref|last_result|last_success_minute|last_success_date|last_attempt_minute|last_attempt_date|successful_scans|failed_scans|last_error")
+servicesDb = init_file("services.db", "DB", "# ip|revision|port|state|service|lan_ip|lib_key|last_seen_minute|last_seen_date")
+librariesDb = init_file("libraries.db", "DB", "# lib_key|lib_name|version|sample_ip|sample_port|status|last_seen")
+init_folder("TARGETS")
+ensure_child_folder(ane_path("TARGETS"), "ARCHIVE")
+
+// -----------------------------------------------------------------------
+// Parameters
+// -----------------------------------------------------------------------
+
+run_once = 0
+force_scan = 0
+directIp = ""
+show_help = 0
+
+for p in params
+	if p == "-h" or p == "--help" then
+		show_help = 1
+	else if p == "--once" then
+		run_once = 1
+	else if p == "--force" then
+		force_scan = 1
+	else if is_valid_ip(p) and directIp == "" then
+		directIp = p
+	else
+		log_state("ERROR", 0, "Invalid parameter " + p)
+		exit("<color=red>MapScan3: invalid parameter " + p + "</color>")
+	end if
+end for
+
+if show_help then
+	helpText = "Usage: " + program_path.split("/")[-1] + " [optional ip_address] [optional --once] [optional --force]"
+	exit("<color=yellow>" + helpText + "</color>")
+end if
+
+if force_scan and directIp == "" then
+	log_state("ERROR", 0, "--force requires an IP address")
+	exit("<color=red>MapScan3: --force requires an IP address.</color>")
+end if
+
+if directIp != "" then queue_direct_target(directIp, force_scan)
+
+refresh_shared_files()
+log_event("MapScan3 v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + " online with lib_functions v" + ANE3_LIB_VERSION + " bld " + ANE3_LIB_BLD + ". Ctrl+C to stop persistent loop.", "#4da6ff")
+report_state("ACTIVE", active_lease, "MapScan3 online")
+
+// -----------------------------------------------------------------------
+// Main scheduler
+// -----------------------------------------------------------------------
+
+while 1
+	nowMinute = current_game_minute()
+	if nowMinute < 0 then
+		log_state("ERROR", 0, "Unable to parse current_date")
+		exit("<color=red>MapScan3: unable to parse the in-game date.</color>")
+	end if
+
+	seedInfo = next_seed()
+
+	if seedInfo.len > 0 then
+		ipAddress = seedInfo[1]
+		sourceName = seedInfo[2]
+		sourceRef = seedInfo[3]
+		requestMode = seedInfo[4]
+		existing = target_record(ipAddress)
+		mustScan = 1
+
+		if requestMode != "FORCE" and existing != "" and target_is_fresh(existing, nowMinute) then
+			mustScan = 0
+		end if
+
+		if mustScan then
+			mark_seed(seedInfo, "SCANNING", "MapScan accepted target request")
+			report_state("ACTIVE", active_lease, "Scanning " + ipAddress + " from " + sourceName)
+			result = scan_target(ipAddress, sourceName, sourceRef)
+			if result then
+				mark_seed(seedInfo, "SCANNED", "Authoritative target snapshot updated")
+			else
+				mark_seed(seedInfo, "FAILED", "Target scan failed; last known-good snapshot preserved")
+			end if
+		else
+			mark_seed(seedInfo, "REUSED", "Existing target snapshot is still fresh")
+			log_event("Fresh target intelligence reused for " + ipAddress, "#4da6ff")
+		end if
+
+		if run_once then shutdown("MapScan3 one-shot cycle complete")
+		wait(1)
+		continue
+	end if
+
+	staleIp = oldest_due_target(nowMinute)
+	if staleIp != "" then
+		report_state("ACTIVE", active_lease, "Refreshing stale target " + staleIp)
+		scan_target(staleIp, "STALE_REFRESH", "FRESHNESS_THRESHOLD")
+
+		if run_once then shutdown("MapScan3 one-shot cycle complete")
+		wait(1)
+		continue
+	end if
+
+	draw_idle_dashboard()
+	report_state("IDLE", scheduler_poll_seconds, idle_state_detail())
+
+	if run_once then shutdown("MapScan3 one-shot cycle complete")
+	wait(scheduler_poll_seconds)
+end while
