@@ -1,0 +1,635 @@
+// =======================================================================
+// ANE3 MISSION RUNNER (mission-runner.src)
+// Episode 11 record-ready candidate v0.1.3 bld 1003
+// -----------------------------------------------------------------------
+// Attended mission-selection and execution-context coordinator.
+//
+// Current responsibilities:
+//   - Read MissionScan's mission manifest and derived mission queue.
+//   - Read MapScan target/seed/service intelligence and LibScan research.
+//   - Display mission preparation/readiness before operator selection.
+//   - Let the operator inspect any available mission.
+//   - Activate only missions that are READY_FOR_EXPSCAN.
+//   - Write a durable active-mission context for ExpScan 2.
+//   - Display Heartbeat's latest reported state.
+//
+// Current boundaries:
+//   - Does not seed MapScan targets; MissionScan owns mission target seeding.
+//   - Does not decide MapScan freshness or force target refreshes.
+//   - Does not launch child commands or own process lifecycle.
+//   - Does not write ExpScan-owned mission execution fields.
+//   - Does not submit mission-completion mail.
+//   - Does not execute exploits.
+// =======================================================================
+
+// ANE3_META|type=script|name=mission-runner|version=0.1.3|last_version=0.1.2|last_bld=1002
+
+SCRIPT_NAME = "mission-runner"
+SCRIPT_COMMAND = "mission-runner"
+SCRIPT_VERSION = "0.1.3"
+SCRIPT_LAST_VERSION = "0.1.2"
+SCRIPT_LAST_BLD = 1002
+
+shell = get_shell
+computer = shell.host_computer
+
+import_code("/home/Archeagus/ANE3/SRC/LIB/lib_functions.src")
+
+SCRIPT_BLD = calc_bld(SCRIPT_VERSION, SCRIPT_LAST_VERSION, SCRIPT_LAST_BLD)
+
+scanner_name = "mission-runner"
+state_grace = 3
+operator_lease = 600
+
+manifestFile = globals.computer.File(ane_path("MANIFEST") + "/ane3.manifest")
+runLog = globals.computer.File(ane_path("LOG") + "/run.log")
+stateFile = init_file("state_mission_runner.txt", "STATES")
+
+// -----------------------------------------------------------------------
+// Shared state and error handling
+// -----------------------------------------------------------------------
+
+refresh_shared_files = function()
+	if globals.manifestFile == null then
+		globals.manifestFile = globals.computer.File(ane_path("MANIFEST") + "/ane3.manifest")
+	end if
+
+	if globals.runLog == null then
+		globals.runLog = globals.computer.File(ane_path("LOG") + "/run.log")
+	end if
+end function
+
+report_state = function(activity, leaseSeconds, detail="")
+	refresh_shared_files()
+	runtimePolicy = check_runtime_policy(globals.manifestFile)
+
+	if runtimePolicy == "UPDATE_AVAILABLE" then
+		log_state("UPDATE_AVAILABLE", leaseSeconds, detail + " | redeploy recommended")
+	else
+		log_state(activity, leaseSeconds, detail)
+	end if
+
+	return runtimePolicy
+end function
+
+fail_runner = function(message)
+	log_event("Mission Runner error: " + message, "red")
+	log_state("ERROR", 0, message)
+	exit(color_text("Mission Runner error: " + message, "red"))
+end function
+
+// -----------------------------------------------------------------------
+// Local file and record helpers
+// -----------------------------------------------------------------------
+
+set_content_checked = function(fileObj, content, context)
+	if fileObj == null then return 0
+	result = fileObj.set_content(content)
+	if result == 1 then return 1
+	log_event("Unable to write " + context + ": " + result, "red")
+	return 0
+end function
+
+record_value = function(recordFile, keyName, defaultValue="")
+	if recordFile == null then return defaultValue
+	prefix = keyName + "="
+	lines = safe_content(recordFile).split(char(10))
+
+	for line in lines
+		if line.indexOf(prefix) == 0 then return slice(line, prefix.len)
+	end for
+
+	return defaultValue
+end function
+
+mission_record = function(missionId)
+	if missionId == "" then return null
+	return globals.computer.File(ane_path("MISSIONS") + "/" + missionId + ".db")
+end function
+
+mission_queue_entries = function()
+	entries = []
+	lines = safe_content(globals.missionQueue).split(char(10))
+
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len < 7 then continue
+		if parts[2] != "AVAILABLE" then continue
+		if not is_valid_ip(parts[4]) then continue
+		entries.push(line)
+	end for
+
+	return entries
+end function
+
+target_record = function(ipAddress)
+	lines = safe_content(globals.targetsDb).split(char(10))
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len > 0 and parts[0] == ipAddress then return line
+	end for
+	return ""
+end function
+
+mission_seed_status = function(ipAddress, missionId)
+	statusName = ""
+	lines = safe_content(globals.targetSeeds).split(char(10))
+
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len < 5 then continue
+		if parts[0] != ipAddress then continue
+		if parts[1] != "MISSION" then continue
+		if parts[2] != missionId then continue
+		statusName = parts[4]
+	end for
+
+	return statusName
+end function
+
+mapped_service_count_for_target = function(ipAddress)
+	count = 0
+	lines = safe_content(globals.servicesDb).split(char(10))
+
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len > 3 and parts[0] == ipAddress then count = count + 1
+	end for
+
+	return count
+end function
+
+open_service_count_for_target = function(ipAddress)
+	count = 0
+	lines = safe_content(globals.servicesDb).split(char(10))
+
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len > 3 and parts[0] == ipAddress and parts[3] == "open" then count = count + 1
+	end for
+
+	return count
+end function
+
+array_contains = function(values, wanted)
+	for value in values
+		if value == wanted then return 1
+	end for
+	return 0
+end function
+
+open_library_keys_for_target = function(ipAddress)
+	keys = []
+	lines = safe_content(globals.servicesDb).split(char(10))
+
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len < 7 then continue
+		if parts[0] != ipAddress then continue
+		if parts[3] != "open" then continue
+		libKey = parts[6]
+		if libKey == "" or libKey == "unknown" then continue
+		if not array_contains(keys, libKey) then keys.push(libKey)
+	end for
+
+	return keys
+end function
+
+library_research_exists = function(libKey)
+	lines = safe_content(globals.exploitsDb).split(char(10))
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len > 0 and parts[0] == libKey then return 1
+	end for
+	return 0
+end function
+
+research_summary_for_target = function(ipAddress)
+	keys = open_library_keys_for_target(ipAddress)
+	researched = 0
+	pending = 0
+
+	for libKey in keys
+		if library_research_exists(libKey) then
+			researched = researched + 1
+		else
+			pending = pending + 1
+		end if
+	end for
+
+	return [keys.len, researched, pending]
+end function
+
+// IMPORTANT: This predicate intentionally mirrors ExpScan 2 candidate_lines:
+// target IP + OPEN service + matching lib_key + non-NONE zone/unsafe value.
+exploit_candidate_count_for_target = function(ipAddress)
+	count = 0
+	serviceLines = safe_content(globals.servicesDb).split(char(10))
+	exploitLines = safe_content(globals.exploitsDb).split(char(10))
+
+	for serviceLine in serviceLines
+		if serviceLine == "" or serviceLine.indexOf("#") == 0 then continue
+		serviceParts = split_fields(serviceLine)
+		if serviceParts.len < 7 then continue
+		if serviceParts[0] != ipAddress then continue
+		if serviceParts[3] != "open" then continue
+
+		libKey = serviceParts[6]
+		if libKey == "" then continue
+
+		for exploitLine in exploitLines
+			if exploitLine == "" or exploitLine.indexOf("#") == 0 then continue
+			exploitParts = split_fields(exploitLine)
+			if exploitParts.len < 5 then continue
+			if exploitParts[0] != libKey then continue
+			if exploitParts[1] == "NONE" or exploitParts[2] == "NONE" then continue
+			count = count + 1
+		end for
+	end for
+
+	return count
+end function
+
+heartbeat_summary = function()
+	if globals.heartbeatState == null then
+		globals.heartbeatState = globals.computer.File(ane_path("STATES") + "/state_heartbeat.txt")
+	end if
+
+	if globals.heartbeatState == null then return "NOT_INITIALIZED"
+	stateLine = safe_content(globals.heartbeatState)
+	if stateLine == "" then return "NO_REPORT"
+
+	parts = split_fields(stateLine)
+	if parts.len < 3 then return "INVALID_STATE"
+
+	detail = ""
+	if parts.len > 10 then detail = parts[10]
+	return parts[2] + " | " + detail
+end function
+
+// -----------------------------------------------------------------------
+// Mission preparation/readiness
+// readiness result:
+// state|detail|mapped_services|open_services|candidate_count|seed_status|
+// researchable_libraries|researched_libraries|pending_libraries
+// -----------------------------------------------------------------------
+
+mission_readiness = function(missionId)
+	recordFile = mission_record(missionId)
+	if recordFile == null then return ["BLOCKED", "Mission record is missing", 0, 0, 0, "NONE", 0, 0, 0]
+
+	targetIp = record_value(recordFile, "target_ip", "")
+	if targetIp == "" or not is_valid_ip(targetIp) then return ["UNPREPARED", "Mission does not contain a valid public target", 0, 0, 0, "NONE", 0, 0, 0]
+
+	seedStatus = mission_seed_status(targetIp, missionId)
+	targetLine = target_record(targetIp)
+	mappedCount = mapped_service_count_for_target(targetIp)
+	openCount = open_service_count_for_target(targetIp)
+	candidateCount = exploit_candidate_count_for_target(targetIp)
+	research = research_summary_for_target(targetIp)
+
+	if seedStatus == "QUEUED" then return ["TARGET_QUEUED", "Mission target is queued for MapScan", mappedCount, openCount, candidateCount, seedStatus, research[0], research[1], research[2]]
+	if seedStatus == "SCANNING" then return ["MAPPING", "MapScan is processing the mission target", mappedCount, openCount, candidateCount, seedStatus, research[0], research[1], research[2]]
+
+	if targetLine == "" then
+		if seedStatus == "FAILED" then return ["BLOCKED", "MapScan request failed and no authoritative target snapshot exists", mappedCount, openCount, candidateCount, seedStatus, research[0], research[1], research[2]]
+		if seedStatus == "" then return ["UNPREPARED", "No MissionScan target relationship is present", mappedCount, openCount, candidateCount, "NONE", research[0], research[1], research[2]]
+		return ["UNPREPARED", "No authoritative MapScan target snapshot exists yet", mappedCount, openCount, candidateCount, seedStatus, research[0], research[1], research[2]]
+	end if
+
+	if mappedCount == 0 then return ["BLOCKED", "Authoritative target snapshot contains no mapped services", mappedCount, openCount, candidateCount, seedStatus, research[0], research[1], research[2]]
+	if openCount == 0 then return ["BLOCKED", "Mapped public target has no open services", mappedCount, openCount, candidateCount, seedStatus, research[0], research[1], research[2]]
+
+	if candidateCount > 0 then
+		detail = "Prepared intelligence contains " + candidateCount + " usable exploit candidate(s)"
+		if seedStatus == "FAILED" then detail = detail + "; latest MapScan request failed, last known-good snapshot retained"
+		return ["READY_FOR_EXPSCAN", detail, mappedCount, openCount, candidateCount, seedStatus, research[0], research[1], research[2]]
+	end if
+
+	if research[2] > 0 then return ["WAITING_FOR_RESEARCH", "LibScan still has " + research[2] + " library record(s) pending research", mappedCount, openCount, candidateCount, seedStatus, research[0], research[1], research[2]]
+	if research[0] == 0 then return ["BLOCKED", "Open services expose no researchable library key", mappedCount, openCount, candidateCount, seedStatus, research[0], research[1], research[2]]
+	return ["BLOCKED", "LibScan research is complete; no usable exploit candidates were found", mappedCount, openCount, candidateCount, seedStatus, research[0], research[1], research[2]]
+end function
+
+readiness_color = function(stateName)
+	if stateName == "READY_FOR_EXPSCAN" then return "green"
+	if stateName == "TARGET_QUEUED" or stateName == "MAPPING" or stateName == "WAITING_FOR_RESEARCH" then return "yellow"
+	if stateName == "BLOCKED" or stateName == "UNPREPARED" then return "red"
+	return "white"
+end function
+
+// -----------------------------------------------------------------------
+// Dashboard and mission inspection
+// -----------------------------------------------------------------------
+
+show_dashboard = function()
+	total = 0
+	attempted = 0
+	completed = 0
+	closed = 0
+	review = 0
+
+	lines = safe_content(globals.missionManifest).split(char(10))
+	for line in lines
+		if line == "" or line.indexOf("#") == 0 then continue
+		parts = split_fields(line)
+		if parts.len < 9 then continue
+
+		total = total + 1
+		if parts[2] == "ATTEMPTED" then attempted = attempted + 1
+		if parts[2] == "COMPLETED" then completed = completed + 1
+		if parts[3] == "CLOSED" then closed = closed + 1
+
+		recordFile = mission_record(parts[0])
+		if record_value(recordFile, "parse_status", "") != "PARSED" then review = review + 1
+	end for
+
+	availableEntries = mission_queue_entries()
+	ready = 0
+	queued = 0
+	mapping = 0
+	waitingResearch = 0
+	blocked = 0
+	unprepared = 0
+
+	for entry in availableEntries
+		parts = split_fields(entry)
+		readiness = mission_readiness(parts[0])
+		status = readiness[0]
+		if status == "READY_FOR_EXPSCAN" then ready = ready + 1
+		if status == "TARGET_QUEUED" then queued = queued + 1
+		if status == "MAPPING" then mapping = mapping + 1
+		if status == "WAITING_FOR_RESEARCH" then waitingResearch = waitingResearch + 1
+		if status == "BLOCKED" then blocked = blocked + 1
+		if status == "UNPREPARED" then unprepared = unprepared + 1
+	end for
+
+	activeMissionId = record_value(globals.activeMission, "mission_id", "")
+	if activeMissionId == "" then activeMissionId = "NONE"
+
+	clear_screen()
+	print_log("ANE3 MISSION RUNNER", "#4da6ff")
+	print_log("-------------------", "#4da6ff")
+	print_log("mission-runner v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + " | lib_functions v" + ANE3_LIB_VERSION + " bld " + ANE3_LIB_BLD, "white")
+	print_log("", "white")
+	print_log("Heartbeat:          " + heartbeat_summary(), "white")
+	print_log("Active mission:     " + activeMissionId, "white")
+	print_log("", "white")
+	print_log("Missions logged:    " + total, "white")
+	print_log("Available:          " + availableEntries.len, "white")
+	print_log("Attempted:          " + attempted, "white")
+	print_log("Completed:          " + completed, "white")
+	print_log("Closed:             " + closed, "white")
+	print_log("Needs review:       " + review, "white")
+	print_log("", "white")
+	print_log("READINESS", "#4da6ff")
+	print_log("Ready for ExpScan:  " + ready, "white")
+	print_log("Target queued:      " + queued, "white")
+	print_log("Mapping:            " + mapping, "white")
+	print_log("Waiting research:   " + waitingResearch, "white")
+	print_log("Blocked:            " + blocked, "white")
+	print_log("Unprepared:         " + unprepared, "white")
+	print_log("", "white")
+end function
+
+print_mission = function(missionId)
+	recordFile = mission_record(missionId)
+	if recordFile == null then
+		print_log("Mission record not found: " + missionId, "red")
+		return 0
+	end if
+
+	targetIp = record_value(recordFile, "target_ip", "")
+	targetLine = target_record(targetIp)
+	targetStatus = "NOT_SCANNED"
+	targetRevision = "0"
+	targetLastSuccess = ""
+
+	if targetLine != "" then
+		targetStatus = get_field(targetLine, 4)
+		targetRevision = get_field(targetLine, 1)
+		targetLastSuccess = get_field(targetLine, 6)
+	end if
+
+	readiness = mission_readiness(missionId)
+
+	print_log("Mission:            " + missionId, "white")
+	print_log("Status:             " + record_value(recordFile, "status", "UNKNOWN"), "white")
+	print_log("Queue:              " + record_value(recordFile, "queue_status", "UNKNOWN"), "white")
+	print_log("Parse status:       " + record_value(recordFile, "parse_status", "UNKNOWN"), "white")
+	print_log("Type:               " + record_value(recordFile, "mission_type", "UNKNOWN"), "white")
+	print_log("Priority:           " + record_value(recordFile, "priority", "NORMAL"), "white")
+	print_log("Objective:          " + record_value(recordFile, "objective", ""), "white")
+	print_log("Public target:      " + targetIp, "white")
+	print_log("LAN target:         " + record_value(recordFile, "target_lan_ip", ""), "white")
+	print_log("", "white")
+	print_log("Readiness:          " + readiness[0], readiness_color(readiness[0]))
+	print_log("Reason:             " + readiness[1], "white")
+	print_log("Mission target seed: " + readiness[5], "white")
+	print_log("Target record:      " + targetStatus + " r" + targetRevision, "white")
+	if targetLastSuccess != "" then print_log("Last successful:    " + targetLastSuccess, "white")
+	print_log("Mapped services:    " + readiness[2], "white")
+	print_log("Open services:      " + readiness[3], "white")
+	print_log("Researchable libs:  " + readiness[6], "white")
+	print_log("Researched libs:    " + readiness[7], "white")
+	print_log("Research pending:   " + readiness[8], "white")
+	print_log("Exploit candidates: " + readiness[4], "white")
+	print_log("ExpScan status:     " + record_value(recordFile, "expscan_status", "NOT_STARTED"), "white")
+	print_log("", "white")
+	return 1
+end function
+
+list_available_missions = function()
+	entries = mission_queue_entries()
+
+	if entries.len == 0 then
+		print_log("No missions are currently available.", "yellow")
+		return entries
+	end if
+
+	print_log("AVAILABLE MISSIONS", "#4da6ff")
+	print_log("------------------", "#4da6ff")
+
+	for index in entries.indexes
+		parts = split_fields(entries[index])
+		missionId = parts[0]
+		readiness = mission_readiness(missionId)
+		print_log("[" + index + "] " + missionId + " | " + readiness[0] + " | " + parts[3] + " | " + parts[4], readiness_color(readiness[0]))
+	end for
+
+	print_log("", "white")
+	return entries
+end function
+
+choose_available_mission = function(promptText)
+	entries = list_available_missions()
+	if entries.len == 0 then return ""
+
+	report_state("IDLE", operator_lease, "Waiting for mission selection")
+	selectionText = user_input(promptText)
+	if selectionText == "-1" or selectionText == "" then return ""
+
+	selection = selectionText.to_int
+	if selection < 0 or selection >= entries.len then
+		print_log("Selection is outside the available range.", "red")
+		return ""
+	end if
+
+	parts = split_fields(entries[selection])
+	return parts[0]
+end function
+
+inspect_mission = function()
+	missionId = choose_available_mission("Inspect mission index, or -1 to cancel: ")
+	if missionId == "" then return
+	print_log("", "white")
+	print_mission(missionId)
+end function
+
+// -----------------------------------------------------------------------
+// Active mission context
+// -----------------------------------------------------------------------
+
+write_active_handoff = function(missionId)
+	recordFile = mission_record(missionId)
+	if recordFile == null then return 0
+
+	readiness = mission_readiness(missionId)
+	if readiness[0] != "READY_FOR_EXPSCAN" then return 0
+
+	targetIp = record_value(recordFile, "target_ip", "")
+	targetLine = target_record(targetIp)
+	targetRevision = "0"
+	if targetLine != "" then targetRevision = get_field(targetLine, 1)
+
+	content = "schema_version=2" + char(10)
+	content = content + "mission_id=" + missionId + char(10)
+	content = content + "mission_record=/ANE3/MISSIONS/" + missionId + ".db" + char(10)
+	content = content + "selected_at=" + current_date + char(10)
+	content = content + "readiness=" + readiness[0] + char(10)
+	content = content + "target_ip=" + targetIp + char(10)
+	content = content + "target_revision=" + targetRevision + char(10)
+	content = content + "open_service_count=" + readiness[3] + char(10)
+	content = content + "exploit_candidate_count=" + readiness[4]
+
+	return set_content_checked(globals.activeMission, content, "active mission context")
+end function
+
+select_mission = function()
+	missionId = choose_available_mission("Select READY mission index, or -1 to cancel: ")
+	if missionId == "" then return
+
+	print_log("", "white")
+	print_mission(missionId)
+	readiness = mission_readiness(missionId)
+
+	if readiness[0] != "READY_FOR_EXPSCAN" then
+		print_log("Mission was not activated. Mission Runner only activates READY_FOR_EXPSCAN work.", "yellow")
+		print_log("Preparation remains owned by MissionScan, MapScan, and LibScan.", "white")
+		return
+	end if
+
+	if not write_active_handoff(missionId) then
+		print_log("Unable to write the active mission context.", "red")
+		return
+	end if
+
+	print_log("Active mission selected: " + missionId, "green")
+	print_log("Active context: /ANE3/MISSIONS/active-mission.db", "white")
+	print_log("Next attended command: expscan2", "white")
+end function
+
+show_active_mission = function()
+	missionId = record_value(globals.activeMission, "mission_id", "")
+	if missionId == "" then
+		print_log("No active mission is selected.", "yellow")
+		return
+	end if
+
+	print_mission(missionId)
+	storedReadiness = record_value(globals.activeMission, "readiness", record_value(globals.activeMission, "handoff_status", "UNKNOWN"))
+	currentStatus = mission_readiness(missionId)
+	currentReadiness = currentStatus[0]
+	print_log("Selected at:         " + record_value(globals.activeMission, "selected_at", "UNKNOWN"), "white")
+	print_log("Selected readiness:  " + storedReadiness, "white")
+	print_log("Current readiness:   " + currentReadiness, readiness_color(currentReadiness))
+	if currentReadiness != "READY_FOR_EXPSCAN" then print_log("Preparation changed since selection; re-evaluate before ExpScan execution.", "yellow")
+end function
+
+// -----------------------------------------------------------------------
+// Bootstrap
+// -----------------------------------------------------------------------
+
+missionManifest = globals.computer.File(ane_path("MISSIONS") + "/manifest.db")
+missionQueue = globals.computer.File(ane_path("DB") + "/mission-queue.db")
+activeMission = init_file("active-mission.db", "MISSIONS", "schema_version=2" + char(10) + "mission_id=")
+targetSeeds = globals.computer.File(ane_path("DB") + "/target-seeds.db")
+targetsDb = globals.computer.File(ane_path("DB") + "/targets.db")
+servicesDb = globals.computer.File(ane_path("DB") + "/services.db")
+exploitsDb = globals.computer.File(ane_path("DB") + "/exploits.db")
+heartbeatState = globals.computer.File(ane_path("STATES") + "/state_heartbeat.txt")
+
+if missionManifest == null or missionQueue == null then fail_runner("MissionScan data is not initialized; run missionscan1 first")
+
+// -----------------------------------------------------------------------
+// Parameters and main menu
+// -----------------------------------------------------------------------
+
+dashboard_only = 0
+
+if params.len > 1 or has_flag("-h") or has_flag("--help") then
+	exit("<color=yellow>Usage: " + program_path.split("/")[-1] + " [optional --dashboard]</color>")
+end if
+
+if params.len == 1 then
+	if params[0] == "--dashboard" then
+		dashboard_only = 1
+	else
+		fail_runner("Invalid parameter " + params[0])
+	end if
+end if
+
+refresh_shared_files()
+log_event("Mission Runner v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + " online.", "#4da6ff")
+report_state("ACTIVE", 30, "Mission Runner online")
+show_dashboard()
+
+if dashboard_only then shutdown("Mission Runner dashboard complete")
+
+while 1
+	print_log("[1] Refresh dashboard", "white")
+	print_log("[2] List available missions", "white")
+	print_log("[3] Inspect mission readiness", "white")
+	print_log("[4] Select READY mission", "white")
+	print_log("[5] Show active mission", "white")
+	print_log("[0] Exit", "white")
+	print_log("", "white")
+
+	report_state("IDLE", operator_lease, "Awaiting operator command")
+	choice = user_input("Mission Runner: ")
+
+	if choice == "1" then
+		show_dashboard()
+	else if choice == "2" then
+		list_available_missions()
+	else if choice == "3" then
+		inspect_mission()
+	else if choice == "4" then
+		select_mission()
+	else if choice == "5" then
+		show_active_mission()
+	else if choice == "0" then
+		shutdown("Mission Runner offline")
+	else
+		print_log("Unknown command.", "yellow")
+	end if
+
+	print_log("", "white")
+end while
