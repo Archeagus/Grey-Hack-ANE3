@@ -1,0 +1,490 @@
+// =======================================================================
+// ANE3 EXPSCAN 2 (expscan2.src)
+// Episode 11 readiness-alignment test candidate v0.1.3 bld 1003
+// -----------------------------------------------------------------------
+// Attended single-candidate exploit execution with durable result persistence and Shell handoff.
+//
+// Current responsibilities:
+//   - Read a Mission Runner handoff or an explicit mission ID.
+//   - Honor Mission Runner readiness when execution begins from active context.
+//   - Correlate MapScan services with LibScan exploit candidates.
+//   - Present current candidate context for operator selection.
+//   - Execute exactly one overflow test.
+//   - Classify the returned object conservatively.
+//   - Append a normalized test result.
+//   - Update the exploit knowledge row and mission execution fields.
+//
+// Current boundaries:
+//   - No bulk exploit sweep.
+//   - No automatic mission-completion submission.
+//   - No system-log deletion.
+//   - A returned Shell may be opened interactively after result persistence.
+//   - No automatic bash launch.
+//   - No automated LAN pivot workflow.
+//   - A missing candidate after READY handoff is treated as a readiness mismatch,
+//     not as a request for ExpScan to perform preparation work.
+// =======================================================================
+
+// ANE3_META|type=script|name=expscan2|version=0.1.3|last_version=0.1.2|last_bld=1002
+
+SCRIPT_NAME = "expscan2"
+SCRIPT_COMMAND = "expscan2"
+SCRIPT_VERSION = "0.1.3"
+SCRIPT_LAST_VERSION = "0.1.2"
+SCRIPT_LAST_BLD = 1002
+
+shell = get_shell
+computer = shell.host_computer
+
+import_code("/home/Archeagus/ANE3/SRC/LIB/lib_functions.src")
+
+SCRIPT_BLD = calc_bld(SCRIPT_VERSION, SCRIPT_LAST_VERSION, SCRIPT_LAST_BLD)
+
+scanner_name = "expscan2"
+state_grace = 3
+active_lease = 30
+operator_lease = 600
+
+manifestFile = globals.computer.File(ane_path("MANIFEST") + "/ane3.manifest")
+runLog = globals.computer.File(ane_path("LOG") + "/run.log")
+stateFile = init_file("state_expscan2.txt", "STATES")
+
+metax = include_lib("/lib/metaxploit.so")
+if not metax then
+	log_state("ERROR", 0, "Unable to find /lib/metaxploit.so")
+	exit("<color=red>ExpScan2: unable to find /lib/metaxploit.so</color>")
+end if
+
+// -----------------------------------------------------------------------
+// Shared state and error handling
+// -----------------------------------------------------------------------
+
+refresh_shared_files = function()
+	if globals.manifestFile == null then
+		globals.manifestFile = globals.computer.File(ane_path("MANIFEST") + "/ane3.manifest")
+	end if
+
+	if globals.runLog == null then
+		globals.runLog = globals.computer.File(ane_path("LOG") + "/run.log")
+	end if
+end function
+
+report_state = function(activity, leaseSeconds, detail="")
+	refresh_shared_files()
+	runtimePolicy = check_runtime_policy(globals.manifestFile)
+
+	if runtimePolicy == "UPDATE_AVAILABLE" then
+		log_state("UPDATE_AVAILABLE", leaseSeconds, detail + " | redeploy recommended")
+	else
+		log_state(activity, leaseSeconds, detail)
+	end if
+
+	return runtimePolicy
+end function
+
+fail_expscan = function(message)
+	log_event("ExpScan2 error: " + message, "red")
+	log_state("ERROR", 0, message)
+	exit(color_text("ExpScan2 error: " + message, "red"))
+end function
+
+// -----------------------------------------------------------------------
+// File and record helpers
+// -----------------------------------------------------------------------
+
+set_content_checked = function(fileObj, content, context)
+	if fileObj == null then return 0
+	result = fileObj.set_content(content)
+	if result == 1 then return 1
+	log_event("Unable to write " + context + ": " + result, "red")
+	return 0
+end function
+
+replace_line_at = function(fileObj, lineIndex, newLine)
+	if fileObj == null then return 0
+	lines = safe_content(fileObj).split(char(10))
+	if lineIndex < 0 or lineIndex >= lines.len then return 0
+	lines[lineIndex] = newLine
+	return set_content_checked(fileObj, lines.join(char(10)), "database line replacement")
+end function
+
+record_value = function(recordFile, keyName, defaultValue="")
+	if recordFile == null then return defaultValue
+	prefix = keyName + "="
+	lines = safe_content(recordFile).split(char(10))
+
+	for line in lines
+		if line.indexOf(prefix) == 0 then return slice(line, prefix.len)
+	end for
+
+	return defaultValue
+end function
+
+upsert_record_value = function(recordFile, keyName, newValue)
+	if recordFile == null then return 0
+
+	prefix = keyName + "="
+	lines = safe_content(recordFile).split(char(10))
+	outputLines = []
+	found = 0
+
+	for line in lines
+		if line.indexOf(prefix) == 0 then
+			if not found then outputLines.push(prefix + newValue)
+			found = 1
+		else
+			outputLines.push(line)
+		end if
+	end for
+
+	if not found then outputLines.push(prefix + newValue)
+	return set_content_checked(recordFile, outputLines.join(char(10)), "mission record field " + keyName)
+end function
+
+sanitize_field = function(value)
+	if value == null then return ""
+	clean = value.replace("[|]", "/")
+	clean = clean.replace(char(10), " ")
+	return clean.trim
+end function
+
+mission_record = function(missionId)
+	if missionId == "" then return null
+	return globals.computer.File(ane_path("MISSIONS") + "/" + missionId + ".db")
+end function
+
+active_mission_id = function()
+	if globals.activeMission == null then return ""
+	return record_value(globals.activeMission, "mission_id", "")
+end function
+
+active_handoff_readiness = function()
+	if globals.activeMission == null then return ""
+	readiness = record_value(globals.activeMission, "readiness", "")
+	if readiness != "" then return readiness
+	return record_value(globals.activeMission, "handoff_status", "")
+end function
+
+// -----------------------------------------------------------------------
+// Candidate correlation
+// candidate:
+// port|lan_ip|lib_key|zone|unsafe_value|prior_result|prior_status|
+// exploit_line_index
+// -----------------------------------------------------------------------
+
+candidate_lines = function(ipAddress)
+	candidates = []
+	serviceLines = safe_content(globals.servicesDb).split(char(10))
+	exploitLines = safe_content(globals.exploitsDb).split(char(10))
+
+	for serviceLine in serviceLines
+		if serviceLine == "" or serviceLine.indexOf("#") == 0 then continue
+		serviceParts = split_fields(serviceLine)
+		if serviceParts.len < 7 then continue
+		if serviceParts[0] != ipAddress then continue
+		if serviceParts[3] != "open" then continue
+
+		portNumber = serviceParts[2]
+		lanIp = serviceParts[5]
+		libKey = serviceParts[6]
+		if libKey == "" then continue
+
+		for exploitIndex in exploitLines.indexes
+			exploitLine = exploitLines[exploitIndex]
+			if exploitLine == "" or exploitLine.indexOf("#") == 0 then continue
+			exploitParts = split_fields(exploitLine)
+			if exploitParts.len < 5 then continue
+			if exploitParts[0] != libKey then continue
+			if exploitParts[1] == "NONE" or exploitParts[2] == "NONE" then continue
+
+			candidate = portNumber + "|" + lanIp + "|" + libKey + "|" + exploitParts[1] + "|" + exploitParts[2] + "|" + exploitParts[3] + "|" + exploitParts[4] + "|" + exploitIndex
+			candidates.push(candidate)
+		end for
+	end for
+
+	return candidates
+end function
+
+print_candidates = function(candidates)
+	print_log("AVAILABLE EXPLOIT CANDIDATES", "#4da6ff")
+	print_log("----------------------------", "#4da6ff")
+
+	for index in candidates.indexes
+		parts = split_fields(candidates[index])
+		print_log("[" + index + "] port " + parts[0] + " | " + parts[2] + " | zone " + parts[3] + " | " + parts[4] + " | history " + parts[5] + "/" + parts[6], "white")
+	end for
+
+	print_log("", "white")
+end function
+
+// -----------------------------------------------------------------------
+// Result classification
+// -----------------------------------------------------------------------
+
+shell_owner = function(resultShell)
+	targetComputer = resultShell.host_computer
+	if targetComputer == null then return "UNKNOWN"
+
+	probeName = "ane3_expscan_" + time + ".tmp"
+	touchResult = targetComputer.touch("/var", probeName)
+	if touchResult != 1 then return "UNKNOWN"
+
+	probeFile = targetComputer.File("/var/" + probeName)
+	if probeFile == null then return "UNKNOWN"
+
+	ownerName = probeFile.owner
+	probeFile.delete
+	if ownerName == "" then return "UNKNOWN"
+	return ownerName
+end function
+
+classify_result = function(resultObject, passwordArgument)
+	resultType = "UNKNOWN_OUTPUT"
+	privilege = ""
+	notesText = ""
+
+	if resultObject == null then
+		resultType = "NO_RESULT"
+		return [resultType, privilege, notesText]
+	end if
+
+	nativeType = typeof(resultObject)
+
+	if nativeType == "shell" then
+		resultType = "SHELL"
+		privilege = shell_owner(resultObject)
+	else if nativeType == "number" then
+		resultType = "PASSWORD"
+		print_log("Overflow returned a password-style numeric result.", "yellow")
+		print_log("Tested password argument: " + passwordArgument, "white")
+		report_state("IDLE", operator_lease, "Waiting for password privilege classification")
+		level = user_input("Privilege [r=root, u=user, g=guest, x=unknown]: ")
+
+		if level == "r" then
+			privilege = "root"
+		else if level == "u" then
+			username = user_input("Username, or blank if unknown: ")
+			privilege = "user"
+			if username != "" then privilege = "user:" + username
+		else if level == "g" then
+			privilege = "guest"
+		else
+			privilege = "unknown"
+		end if
+	else if nativeType == "file" then
+		resultType = "FILE"
+	else if nativeType == "computer" then
+		resultType = "COMPUTER"
+	else
+		resultType = "TYPE:" + nativeType
+	end if
+
+	return [resultType, privilege, notesText]
+end function
+
+// -----------------------------------------------------------------------
+// Persistence
+// -----------------------------------------------------------------------
+
+update_exploit_knowledge = function(exploitLineIndex, libKey, zone, unsafeValue, resultType, privilege, missionId, targetIp, portNumber)
+	statusName = "tested"
+	if resultType == "NO_RESULT" then statusName = "tested_no_result"
+
+	note = missionId + " on " + targetIp + ":" + portNumber
+	if privilege != "" then note = note + " privilege=" + privilege
+
+	newLine = libKey + "|" + zone + "|" + unsafeValue + "|" + resultType + "|" + statusName + "|" + current_date + "|" + sanitize_field(note)
+	return replace_line_at(globals.exploitsDb, exploitLineIndex, newLine)
+end function
+
+append_test_result = function(missionId, targetIp, targetLanIp, portNumber, libKey, zone, unsafeValue, resultType, privilege, statusName, notesText)
+	line = current_date + "|" + missionId + "|" + targetIp + "|" + targetLanIp + "|" + portNumber + "|" + libKey + "|" + zone + "|" + unsafeValue + "|" + resultType + "|" + privilege + "|" + statusName + "|" + sanitize_field(notesText)
+	return append_line(globals.exploitResults, line)
+end function
+
+update_mission_execution = function(recordFile, libKey, zone, unsafeValue, resultType, privilege)
+	selected = libKey + ":" + zone + ":" + unsafeValue
+	if not upsert_record_value(recordFile, "expscan_status", "TESTED") then return 0
+	if not upsert_record_value(recordFile, "expscan_session", current_date) then return 0
+	if not upsert_record_value(recordFile, "selected_exploit", sanitize_field(selected)) then return 0
+	if not upsert_record_value(recordFile, "access_result", resultType) then return 0
+	if not upsert_record_value(recordFile, "privilege_result", privilege) then return 0
+	return 1
+end function
+
+// -----------------------------------------------------------------------
+// Bootstrap and mission selection
+// -----------------------------------------------------------------------
+
+activeMission = globals.computer.File(ane_path("MISSIONS") + "/active-mission.db")
+servicesDb = init_file("services.db", "DB", "# ip|revision|port|state|service|lan_ip|lib_key|last_seen_minute|last_seen_date")
+exploitsDb = init_file("exploits.db", "DB", "# lib_key|zone|unsafe_value|result_type|status|last_tested|notes")
+exploitResults = init_file("exploit-results.db", "DB", "# tested_at|mission_id|target_ip|target_lan_ip|port|lib_key|zone|unsafe_value|result_type|privilege|status|notes")
+
+if params.len > 1 or has_flag("-h") or has_flag("--help") then
+	exit("<color=yellow>Usage: " + program_path.split("/")[-1] + " [optional mission_id]</color>")
+end if
+
+missionId = ""
+usingActiveHandoff = 0
+if params.len == 1 then missionId = params[0]
+if missionId == "" then
+	missionId = active_mission_id()
+	usingActiveHandoff = 1
+end if
+
+if missionId == "" then fail_expscan("No mission ID supplied and no active Mission Runner handoff exists")
+if missionId.indexOf("M-") != 0 then fail_expscan("Invalid mission ID " + missionId)
+
+if usingActiveHandoff then
+	handoffReadiness = active_handoff_readiness()
+	if handoffReadiness != "" and handoffReadiness != "READY_FOR_EXPSCAN" then fail_expscan("Active Mission Runner handoff is not READY_FOR_EXPSCAN: " + handoffReadiness)
+else
+	handoffReadiness = "EXPLICIT_MISSION_ID"
+end if
+
+recordFile = mission_record(missionId)
+if recordFile == null then fail_expscan("Mission record not found for " + missionId)
+
+targetIp = record_value(recordFile, "target_ip", "")
+targetLanIp = record_value(recordFile, "target_lan_ip", "")
+objectiveText = record_value(recordFile, "objective", "")
+missionType = record_value(recordFile, "mission_type", "UNKNOWN")
+queueStatus = record_value(recordFile, "queue_status", "UNKNOWN")
+
+if queueStatus != "AVAILABLE" then fail_expscan("Mission is not available for attended execution: " + queueStatus)
+if not is_valid_ip(targetIp) then fail_expscan("Mission does not contain a valid public target")
+
+refresh_shared_files()
+log_event("ExpScan2 v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + " opened " + missionId + ".", "#4da6ff")
+report_state("ACTIVE", active_lease, "Loading exploit candidates for " + missionId)
+
+print_log("ANE3 EXPSCAN 2", "#4da6ff")
+print_log("--------------", "#4da6ff")
+print_log("expscan2 v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + " | lib_functions v" + ANE3_LIB_VERSION + " bld " + ANE3_LIB_BLD, "white")
+print_log("Mission:      " + missionId, "white")
+print_log("Type:         " + missionType, "white")
+print_log("Objective:    " + objectiveText, "white")
+print_log("Public IP:    " + targetIp, "white")
+print_log("LAN target:   " + targetLanIp, "white")
+if usingActiveHandoff then print_log("Runner state: " + handoffReadiness, "white")
+if not usingActiveHandoff then print_log("Context:      explicit mission ID", "yellow")
+print_log("", "white")
+
+candidates = candidate_lines(targetIp)
+
+if candidates.len == 0 then
+	print_log("READINESS MISMATCH", "yellow")
+	print_log("No current open-service exploit candidates are available for " + missionId + ".", "yellow")
+	if usingActiveHandoff then print_log("Mission Runner marked this mission READY_FOR_EXPSCAN, but the prepared intelligence no longer matches.", "white")
+	if not usingActiveHandoff then print_log("The explicit mission ID does not currently satisfy the ExpScan execution predicate.", "white")
+	print_log("Return to Mission Runner and reevaluate readiness. ExpScan has not changed mission execution state.", "white")
+	report_state("IDLE", 0, "Readiness mismatch for " + missionId)
+	shutdown("ExpScan2 readiness mismatch for " + missionId)
+end if
+
+print_candidates(candidates)
+report_state("IDLE", operator_lease, "Waiting for exploit selection")
+selectionText = user_input("Select one candidate, or -1 to cancel: ")
+
+if selectionText == "-1" or selectionText == "" then
+	shutdown("ExpScan2 cancelled before execution")
+end if
+
+selection = selectionText.to_int
+if selection < 0 or selection >= candidates.len then fail_expscan("Selection is outside the available range")
+
+candidate = split_fields(candidates[selection])
+portNumber = candidate[0].to_int
+serviceLanIp = candidate[1]
+libKey = candidate[2]
+zone = candidate[3]
+unsafeValue = candidate[4]
+priorResult = candidate[5]
+priorStatus = candidate[6]
+exploitLineIndex = candidate[7].to_int
+
+passwordArgument = user_input("Password argument [default=password]: ")
+if passwordArgument == "" then passwordArgument = "password"
+
+print_log("", "white")
+print_log("TESTING ONE CANDIDATE", "#4da6ff")
+print_log("Target:      " + targetIp + ":" + portNumber, "white")
+print_log("Service LAN: " + serviceLanIp, "white")
+print_log("Library:     " + libKey, "white")
+print_log("Zone:        " + zone, "white")
+print_log("Unsafe check:" + unsafeValue, "white")
+print_log("History:     " + priorResult + "/" + priorStatus, "white")
+print_log("", "white")
+print_log("Native overflow output follows. ExpScan will not redraw this terminal.", "yellow")
+
+report_state("ACTIVE", active_lease, "Connecting to " + targetIp + ":" + portNumber)
+netSession = metax.net_use(targetIp, portNumber)
+if not netSession then fail_expscan("Unable to connect to target port")
+
+metaLib = netSession.dump_lib
+actualLibKey = metaLib.lib_name + "-v" + metaLib.version
+if actualLibKey != libKey then
+	fail_expscan("Service library changed. Expected " + libKey + " but found " + actualLibKey)
+end if
+
+report_state("ACTIVE", active_lease, "Testing " + libKey + " zone " + zone)
+resultObject = metaLib.overflow(zone, unsafeValue, passwordArgument)
+classification = classify_result(resultObject, passwordArgument)
+resultType = classification[0]
+privilege = classification[1]
+notesText = classification[2]
+
+print_log("", "white")
+print_log("CLASSIFICATION", "#4da6ff")
+print_log("Result type: " + resultType, "white")
+print_log("Privilege:   " + privilege, "white")
+print_log("", "white")
+
+report_state("IDLE", operator_lease, "Waiting for operator notes")
+operatorNotes = user_input("Optional result notes: ")
+if operatorNotes != "" then notesText = operatorNotes
+
+resultStatus = "RECORDED"
+if resultType == "NO_RESULT" then resultStatus = "NO_USEFUL_RESULT"
+
+if not update_exploit_knowledge(exploitLineIndex, libKey, zone, unsafeValue, resultType, privilege, missionId, targetIp, portNumber) then
+	fail_expscan("Unable to update exploit knowledge")
+end if
+
+if not append_test_result(missionId, targetIp, targetLanIp, portNumber, libKey, zone, unsafeValue, resultType, privilege, resultStatus, notesText) then
+	fail_expscan("Unable to append exploit result")
+end if
+
+if not update_mission_execution(recordFile, libKey, zone, unsafeValue, resultType, privilege) then
+	fail_expscan("Unable to update mission execution fields")
+end if
+
+log_event("ExpScan2 recorded " + resultType + " for " + missionId + " using " + libKey + " zone " + zone + ".", "#4da6ff")
+
+// Persist first, then hand control to an acquired shell.
+// start_terminal is deliberately used only for a Shell result and does not
+// depend on unverified concurrent shell.launch behavior.
+if resultType == "SHELL" then
+	print_log("", "white")
+	print_log("REMOTE SHELL ACQUIRED", "green")
+	print_log("Privilege: " + privilege, "white")
+	print_log("The exploit result has already been recorded.", "white")
+	print_log("Opening the acquired shell in this terminal.", "yellow")
+	print_log("Exit the remote shell to return to ExpScan 2.", "white")
+
+	upsert_record_value(recordFile, "expscan_status", "SHELL_OBTAINED")
+	report_state("SHELL_ACTIVE", 3600, missionId + " | " + targetIp + " | privilege=" + privilege)
+
+	// GreyScript does not provide a reliable success acknowledgement for the
+	// terminal handoff. The Shell result itself is authoritative; any later
+	// return simply means terminal control has returned to ExpScan.
+	resultObject.start_terminal
+
+	print_log("", "white")
+	print_log("Remote terminal control returned to ExpScan 2.", "yellow")
+	print_log("The recorded Shell result remains valid; handoff success cannot be distinguished from a normal remote-shell exit.", "white")
+	log_event("ExpScan2 terminal control returned after Shell result for " + missionId + ".", "#4da6ff")
+end if
+
+shutdown("ExpScan2 recorded one attended exploit test for " + missionId)
