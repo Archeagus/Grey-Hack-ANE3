@@ -1,0 +1,384 @@
+// =======================================================================
+// ANE3 SHARED FUNCTIONS (lib_functions.src)
+// Record-ready v0.1.6
+// -----------------------------------------------------------------------
+// Purpose:
+//   Shared ANE3 runtime plumbing only.
+//   This file should not contain scanner behavior, database schema logic,
+//   exploit logic, target selection, manifest ownership, or script-specific
+//   file wrappers.
+// =======================================================================
+
+// ANE3_META|type=lib|name=lib_functions|version=0.1.6|last_version=0.1.5|last_bld=1005
+
+// -----------------------------------------------------------------------
+// Version / build metadata
+// -----------------------------------------------------------------------
+// ANE3 versions are major.minor.patch tuples, not decimal numbers.
+// GreyScript split delimiters are regular expressions; character classes
+// are used for literal periods and pipes: [.] and [|].
+//
+// version_score = (major * 1000000) + (minor * 1000) + patch
+// current_bld = last_bld
+//             + version_score(current_version)
+//             - version_score(last_version)
+//
+// Example:
+//   v0.1.5 bld 1005 -> v0.1.6 bld 1006
+// -----------------------------------------------------------------------
+
+ANE3_LIB_NAME = "lib_functions"
+ANE3_LIB_VERSION = "0.1.6"
+ANE3_LIB_LAST_VERSION = "0.1.5"
+ANE3_LIB_LAST_BLD = 1005
+
+version_score = function(versionText)
+	parts = versionText.split("[.]")
+	major = 0
+	minor = 0
+	patch = 0
+
+	if parts.len > 0 then major = parts[0].to_int
+	if parts.len > 1 then minor = parts[1].to_int
+	if parts.len > 2 then patch = parts[2].to_int
+
+	return (major * 1000000) + (minor * 1000) + patch
+end function
+
+calc_bld = function(currentVersion, lastVersion, lastBld)
+	return lastBld + version_score(currentVersion) - version_score(lastVersion)
+end function
+
+ANE3_LIB_BLD = calc_bld(ANE3_LIB_VERSION, ANE3_LIB_LAST_VERSION, ANE3_LIB_LAST_BLD)
+
+// -----------------------------------------------------------------------
+// ANE3 path / filesystem primitives
+// -----------------------------------------------------------------------
+
+ane_root = function()
+	return home_dir + "/ANE3"
+end function
+
+ane_path = function(folder="/")
+	root = ane_root()
+
+	if folder == "/" then return root
+	if folder == "" then return root
+
+	return root + "/" + folder
+end function
+
+init_folder = function(folder="/")
+	rootParent = home_dir
+	rootPath = ane_root()
+
+	rootObj = globals.computer.File(rootPath)
+	if rootObj == null then globals.computer.create_folder(rootParent, "ANE3")
+
+	if folder == "/" then return rootPath
+	if folder == "" then return rootPath
+
+	folderPath = ane_path(folder)
+	folderObj = globals.computer.File(folderPath)
+	if folderObj == null then globals.computer.create_folder(rootPath, folder)
+
+	return folderPath
+end function
+
+init_file = function(filename, folder="/", defaultContent="")
+	folderPath = init_folder(folder)
+	filePath = folderPath + "/" + filename
+
+	fileObj = globals.computer.File(filePath)
+	if fileObj == null then
+		globals.computer.touch(folderPath, filename)
+		fileObj = globals.computer.File(filePath)
+		if fileObj != null then fileObj.set_content(defaultContent)
+	end if
+
+	return fileObj
+end function
+
+// -----------------------------------------------------------------------
+// Basic text / file primitives
+// -----------------------------------------------------------------------
+
+safe_content = function(fileObj)
+	if fileObj == null then return ""
+	content = fileObj.get_content()
+	if content == null then return ""
+	return content
+end function
+
+append_line = function(fileObj, line)
+	if fileObj == null then return 0
+
+	content = safe_content(fileObj)
+	if content == "" then
+		fileObj.set_content(line)
+	else
+		fileObj.set_content(content + char(10) + line)
+	end if
+
+	return 1
+end function
+
+contains_line = function(fileObj, line)
+	if fileObj == null then return 0
+
+	content = safe_content(fileObj)
+	wrappedContent = char(10) + content + char(10)
+	wrappedLine = char(10) + line + char(10)
+
+	if wrappedContent.indexOf(wrappedLine) == null then return 0
+	return 1
+end function
+
+append_unique = function(fileObj, line)
+	if contains_line(fileObj, line) then return 0
+	return append_line(fileObj, line)
+end function
+
+split_fields = function(line)
+	if line == null then return []
+	return line.split("[|]")
+end function
+
+get_field = function(line, index, delimiter="[|]")
+	if line == null then return ""
+	parts = line.split(delimiter)
+	if parts.len <= index then return ""
+	return parts[index]
+end function
+
+// -----------------------------------------------------------------------
+// Argument helpers
+// -----------------------------------------------------------------------
+
+has_flag = function(flagName)
+	for p in params
+		if p == flagName then return 1
+	end for
+	return 0
+end function
+
+restart_command = function()
+	cmd = globals.SCRIPT_COMMAND
+
+	if cmd == null then cmd = globals.SCRIPT_NAME
+	if cmd == null then cmd = "unknown"
+
+	for p in params
+		cmd = cmd + " " + p
+	end for
+
+	return cmd
+end function
+
+// -----------------------------------------------------------------------
+// Logging helpers
+// -----------------------------------------------------------------------
+
+color_text = function(msg, color="white")
+	if color == "" then return msg
+	return "<color=" + color + ">" + msg + "</color>"
+end function
+
+print_log = function(msg, color="white")
+	print(color_text(msg, color))
+end function
+
+log_event = function(msg, color="white")
+	if globals.runLog != null then append_line(globals.runLog, current_date + "|" + msg)
+	print_log(msg, color)
+end function
+
+// -----------------------------------------------------------------------
+// Heartbeat state writer
+// -----------------------------------------------------------------------
+// Caller globals expected:
+//   SCRIPT_NAME
+//   SCRIPT_VERSION
+//   SCRIPT_BLD
+//   scanner_name
+//   stateFile
+//
+// Caller globals optional:
+//   state_grace
+//
+// State format:
+//   scanner|online_state|activity|wait_seconds|last_beat|expires_at|script_version|script_bld|lib_version|lib_bld|detail
+// -----------------------------------------------------------------------
+
+state_expires = function(waitSeconds)
+	grace = 3
+	if globals.state_grace != null then grace = globals.state_grace
+	return time + waitSeconds + grace
+end function
+
+log_state = function(activity, waitSeconds, detail="")
+	if globals.stateFile == null then return 0
+
+	now = time
+	expiresAt = state_expires(waitSeconds)
+	onlineState = "ONLINE"
+
+	if activity == "OFFLINE" then
+		onlineState = "OFFLINE"
+		expiresAt = now
+	end if
+
+	if activity == "ERROR" then
+		onlineState = "OFFLINE"
+		expiresAt = now
+	end if
+
+	if activity == "UPDATE_REQUIRED" then
+		onlineState = "OFFLINE"
+		expiresAt = now
+	end if
+
+	scriptVersion = globals.SCRIPT_VERSION
+	if scriptVersion == null then scriptVersion = "0.0.0"
+
+	scriptBld = globals.SCRIPT_BLD
+	if scriptBld == null then scriptBld = 0
+
+	line = globals.scanner_name + "|" + onlineState + "|" + activity + "|" + waitSeconds + "|" + now + "|" + expiresAt + "|" + scriptVersion + "|" + scriptBld + "|" + ANE3_LIB_VERSION + "|" + ANE3_LIB_BLD + "|" + detail
+	globals.stateFile.set_content(line)
+
+	return 1
+end function
+
+shutdown = function(message)
+	log_state("OFFLINE", 0, message)
+	exit(color_text(message, "white"))
+end function
+
+// -----------------------------------------------------------------------
+// Manifest lookup primitives
+// -----------------------------------------------------------------------
+// lib_functions does not own the manifest. Heartbeat owns and refreshes it.
+// These helpers only read a caller-provided manifest file.
+// Manifest format:
+//   type|name|version|bld|path|last_checked
+// -----------------------------------------------------------------------
+
+manifest_line = function(manifestFile, componentType, componentName)
+	content = safe_content(manifestFile)
+	lines = content.split(char(10))
+
+	prefix = componentType + "|" + componentName + "|"
+
+	for line in lines
+		if line.indexOf(prefix) == 0 then return line
+	end for
+
+	return ""
+end function
+
+manifest_version = function(manifestFile, componentType, componentName)
+	line = manifest_line(manifestFile, componentType, componentName)
+	if line == "" then return "UNKNOWN"
+	return get_field(line, 2)
+end function
+
+manifest_bld = function(manifestFile, componentType, componentName)
+	line = manifest_line(manifestFile, componentType, componentName)
+	if line == "" then return -1
+	return get_field(line, 3).to_int
+end function
+
+// -----------------------------------------------------------------------
+// Runtime policy helper
+// -----------------------------------------------------------------------
+// Caller decides when to call this, usually at safe loop boundaries.
+// This function returns policy; the active component owns its state report.
+// Policy:
+//   script/lib current       -> CURRENT
+//   script/lib 1 build old   -> UPDATE_AVAILABLE
+//   script/lib 2+ builds old -> UPDATE_REQUIRED exit
+//   missing manifest data    -> UNKNOWN, continue
+// -----------------------------------------------------------------------
+
+check_runtime_policy = function(manifestFile)
+	if manifestFile == null then return "UNKNOWN"
+
+	currentScriptBld = manifest_bld(manifestFile, "script", globals.SCRIPT_NAME)
+	currentLibBld = manifest_bld(manifestFile, "lib", ANE3_LIB_NAME)
+
+	if currentScriptBld < 0 then return "UNKNOWN"
+	if currentLibBld < 0 then return "UNKNOWN"
+
+	scriptDiff = currentScriptBld - globals.SCRIPT_BLD
+	libDiff = currentLibBld - ANE3_LIB_BLD
+
+	if scriptDiff >= 2 or libDiff >= 2 then
+		update_required_exit(manifestFile, scriptDiff, libDiff)
+	end if
+
+	if scriptDiff == 1 or libDiff == 1 then
+		return "UPDATE_AVAILABLE"
+	end if
+
+	return "CURRENT"
+end function
+
+update_required_exit = function(manifestFile, scriptDiff, libDiff)
+	currentScriptVersion = manifest_version(manifestFile, "script", globals.SCRIPT_NAME)
+	currentScriptBld = manifest_bld(manifestFile, "script", globals.SCRIPT_NAME)
+	currentLibVersion = manifest_version(manifestFile, "lib", ANE3_LIB_NAME)
+	currentLibBld = manifest_bld(manifestFile, "lib", ANE3_LIB_NAME)
+
+	reason = ""
+	if scriptDiff >= 2 then reason = reason + "Script is " + scriptDiff + " builds behind. "
+	if libDiff >= 2 then reason = reason + "Shared library is " + libDiff + " builds behind. "
+
+	msg = "ANE3 UPDATE REQUIRED" + char(10) + char(10)
+	msg = msg + globals.SCRIPT_NAME + " detected stale runtime code." + char(10)
+	msg = msg + "Detected: " + current_date + char(10) + char(10)
+
+	msg = msg + "Loaded script: " + globals.SCRIPT_NAME + " v" + globals.SCRIPT_VERSION + " bld " + globals.SCRIPT_BLD + char(10)
+	msg = msg + "Current script: " + globals.SCRIPT_NAME + " v" + currentScriptVersion + " bld " + currentScriptBld + char(10)
+
+	msg = msg + "Loaded lib: " + ANE3_LIB_NAME + " v" + ANE3_LIB_VERSION + " bld " + ANE3_LIB_BLD + char(10)
+	msg = msg + "Current lib: " + ANE3_LIB_NAME + " v" + currentLibVersion + " bld " + currentLibBld + char(10) + char(10)
+
+	msg = msg + "Reason: " + reason + char(10)
+	msg = msg + "Stopping now to avoid writing outdated records." + char(10) + char(10)
+	msg = msg + "Relaunch command:" + char(10)
+	msg = msg + restart_command()
+
+	log_state("UPDATE_REQUIRED", 0, reason + " Relaunch: " + restart_command())
+	print(color_text(msg, "red"))
+	exit(color_text("ANE3 update required. Relaunch with: " + restart_command(), "red"))
+end function
+
+// -----------------------------------------------------------------------
+// Color helpers for Heartbeat display
+// -----------------------------------------------------------------------
+
+activity_color = function(activity)
+	if activity == "ACTIVE" then return "green"
+	if activity == "IDLE" then return "#4da6ff"
+	if activity == "STALE" then return "yellow"
+	if activity == "UPDATE_AVAILABLE" then return "yellow"
+	if activity == "UPDATE_REQUIRED" then return "red"
+	if activity == "OFFLINE" then return "red"
+	if activity == "ERROR" then return "red"
+	return "#999999"
+end function
+
+bld_color = function(currentBld, runningBld)
+	if currentBld < 0 then return "#999999"
+	if runningBld < 0 then return "#999999"
+
+	diff = currentBld - runningBld
+
+	if diff == 0 then return "green"
+	if diff == 1 then return "yellow"
+	if diff >= 2 then return "red"
+
+	// Running build is newer than the registered source build.
+	return "yellow"
+end function
