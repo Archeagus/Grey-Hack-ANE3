@@ -1,0 +1,213 @@
+// Command libscan1
+// ANE3_META|type=script|name=libscan1|version=0.1.11|last_version=0.1.10|last_bld=1010
+
+// Advanced Network Exploitation Engine 3.0
+// LibScan 1 = persistent library vulnerability researcher
+// It reads /ANE3/DB/libraries.db from MapScan 3.
+// It writes unsafe checks to /ANE3/DB/exploits.db, but does NOT execute them.
+//
+// Compile-time dependency:
+//   The source importer requires a literal absolute path. The library is
+//   embedded when this command is deployed and does not update dynamically.
+
+SCRIPT_NAME = "libscan1"
+SCRIPT_COMMAND = "libscan1"
+SCRIPT_VERSION = "0.1.11"
+SCRIPT_LAST_VERSION = "0.1.10"
+SCRIPT_LAST_BLD = 1010
+
+shell = get_shell
+computer = shell.host_computer
+
+import_code("/home/Archeagus/ANE3/SRC/LIB/lib_functions.src")
+
+SCRIPT_BLD = calc_bld(SCRIPT_VERSION, SCRIPT_LAST_VERSION, SCRIPT_LAST_BLD)
+
+scanner_name = "libscan"
+state_grace = 3
+active_lease = 15
+idle_wait = 10
+
+// Heartbeat owns and creates the manifest and shared log.
+// LibScan reads/appends only when those files already exist.
+manifestFile = globals.computer.File(ane_path("MANIFEST") + "/ane3.manifest")
+runLog = globals.computer.File(ane_path("LOG") + "/run.log")
+
+// LibScan owns its state file.
+stateFile = init_file("state_libscan.txt", "STATES")
+
+metax = include_lib("/lib/metaxploit.so")
+if not metax then
+	log_state("ERROR", 0, "Unable to find /lib/metaxploit.so")
+	exit("<color=red>Error: Unable to find /lib/metaxploit.so</color>")
+end if
+
+// ---------- Optional shared-file refresh ----------
+
+refresh_shared_files = function()
+	if globals.manifestFile == null then
+		globals.manifestFile = globals.computer.File(ane_path("MANIFEST") + "/ane3.manifest")
+	end if
+
+	if globals.runLog == null then
+		globals.runLog = globals.computer.File(ane_path("LOG") + "/run.log")
+	end if
+end function
+
+// ---------- Framework state helper ----------
+
+report_state = function(activity, leaseSeconds, detail="")
+	refresh_shared_files()
+	runtimePolicy = check_runtime_policy(globals.manifestFile)
+
+	if runtimePolicy == "UPDATE_AVAILABLE" then
+		log_state("UPDATE_AVAILABLE", leaseSeconds, detail + " | redeploy recommended")
+	else
+		log_state(activity, leaseSeconds, detail)
+	end if
+
+	return runtimePolicy
+end function
+
+// ---------- LibScan-specific helpers ----------
+
+has_exploit_scan = function(libKey)
+	content = safe_content(globals.exploitsDb)
+	wrappedContent = char(10) + content + char(10)
+	if wrappedContent.indexOf(char(10) + libKey + "|") == null then return 0
+	return 1
+end function
+
+find_next_library = function()
+	content = safe_content(globals.librariesDb)
+	lines = content.split(char(10))
+
+	for line in lines
+		if line != "" and line.indexOf("#") != 0 then
+			parts = split_fields(line)
+			if parts.len >= 5 then
+				libKey = parts[0]
+				if libKey != "" and not has_exploit_scan(libKey) then return line
+			end if
+		end if
+	end for
+
+	return ""
+end function
+
+extract_unsafe_checks = function(scanText)
+	results = []
+	xpList = scanText.split("Unsafe check: ")[1:]
+
+	for xp in xpList
+		if xp.indexOf("<b>") != null and xp.indexOf("</b>") != null then
+			labelStart = xp.indexOf("<b>")
+			labelEnd = xp.indexOf("</b>")
+			exploit = xp[labelStart + 3: labelEnd]
+			results.push(exploit)
+		end if
+	end for
+
+	return results
+end function
+
+scan_library_line = function(libLine)
+	parts = split_fields(libLine)
+	if parts.len < 5 then return 0
+
+	libKey = parts[0]
+	libName = parts[1]
+	libVersion = parts[2]
+	sampleIp = parts[3]
+	samplePort = parts[4].to_int
+
+	report_state("ACTIVE", active_lease, "Connecting to sample for " + libKey)
+
+	print_log("[+] LibScan1 v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + " scanning " + libKey, "white")
+	print_log("[+] Embedded runtime: lib_functions v" + ANE3_LIB_VERSION + " bld " + ANE3_LIB_BLD, "white")
+	print_log("[+] Sample source: " + sampleIp + ":" + samplePort, "white")
+
+	net_session = metax.net_use(sampleIp, samplePort)
+	if not net_session then
+		log_event("LibScan could not reconnect to sample " + sampleIp + ":" + samplePort + " for " + libKey, "yellow")
+		return 0
+	end if
+
+	metaLib = net_session.dump_lib
+	actualKey = metaLib.lib_name + "-v" + metaLib.version
+	if actualKey != libKey then
+		log_event("LibScan sample changed. Expected " + libKey + " but found " + actualKey, "yellow")
+	end if
+
+	report_state("ACTIVE", active_lease, "Scanning vulnerability zones for " + libKey)
+	scanResult = metax.scan(metaLib)
+
+	if scanResult == null or scanResult.len == 0 then
+		append_unique(globals.exploitsDb, libKey + "|NONE|NONE|none|scanned|never|No vulnerable zones found")
+		log_event("LibScan completed " + libKey + " with no vulnerable zones.", "white")
+		return 1
+	end if
+
+	foundCount = 0
+	for zone in scanResult
+		report_state("ACTIVE", active_lease, "Researching " + libKey + " zone " + zone)
+		memory_scan = metax.scan_address(metaLib, zone)
+		unsafeChecks = extract_unsafe_checks(memory_scan)
+
+		if unsafeChecks.len == 0 then
+			append_unique(globals.exploitsDb, libKey + "|" + zone + "|NONE|none|scanned|never|Zone found, but no unsafe labels parsed")
+		else
+			for exploit in unsafeChecks
+				exploitLine = libKey + "|" + zone + "|" + exploit + "|unknown|untested|never|" + sampleIp + ":" + samplePort
+				if append_unique(globals.exploitsDb, exploitLine) then foundCount = foundCount + 1
+			end for
+		end if
+	end for
+
+	log_event("LibScan completed " + libKey + "; queued " + foundCount + " unsafe checks.", "white")
+	return 1
+end function
+
+// ---------- Bootstrap ANE3 operational files ----------
+
+librariesDb = init_file("libraries.db", "DB", "# lib_key|lib_name|version|sample_ip|sample_port|status|last_seen")
+exploitsDb = init_file("exploits.db", "DB", "# lib_key|zone|unsafe_value|result_type|status|last_tested|notes")
+
+// ---------- Parameter handling ----------
+
+run_once = 0
+
+if params.len > 1 or has_flag("-h") or has_flag("--help") then
+	exit("<color=yellow>Usage: " + program_path.split("/")[-1] + " [optional --once]</color>")
+end if
+
+if params.len == 1 then
+	if params[0] == "--once" then
+		run_once = 1
+	else
+		log_state("ERROR", 0, "Invalid parameter " + params[0])
+		exit("<color=red>LibScan1: invalid parameter " + params[0] + "</color>")
+	end if
+end if
+
+refresh_shared_files()
+log_event("LibScan1 v" + SCRIPT_VERSION + " bld " + SCRIPT_BLD + " online with lib_functions v" + ANE3_LIB_VERSION + " bld " + ANE3_LIB_BLD + ". Ctrl+C to stop persistent loop.", "#4da6ff")
+report_state("ACTIVE", active_lease, "LibScan1 online")
+
+while 1
+	libLine = find_next_library()
+
+	if libLine != "" then
+		libKey = get_field(libLine, 0)
+		report_state("ACTIVE", active_lease, "Researching " + libKey)
+		scan_library_line(libLine)
+
+		if run_once then shutdown("LibScan1 one-shot cycle complete")
+		wait(1)
+	else
+		report_state("IDLE", idle_wait, "No unscanned libraries")
+
+		if run_once then shutdown("LibScan1 one-shot cycle complete")
+		wait(idle_wait)
+	end if
+end while
