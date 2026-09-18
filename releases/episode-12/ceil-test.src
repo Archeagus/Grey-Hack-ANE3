@@ -1,0 +1,26 @@
+//Ceil() test script
+// Also testing for raw division, integer math and scalar math
+
+// Pages variable, index array and decimal array
+p = 6
+data = [1, 3, 6, 7, 12, 13, 34]
+dec = [0.1, 1.0, 1.1, 3.9]
+
+print("Greyscript Ceil() Test")
+print("--------------------------")
+print("")
+
+// Raw division test
+print("Raw Division Test")
+for d in data
+    print(d + "/" + p + "=" + (d / p))
+    print(d + "Ceil(" + d + "/" + p + ") = " + ceil(d / p))
+end for
+print("")
+
+// Ceil() decimal test
+print("Ceil() Decimal Test")
+for d in dec
+    print("Ceil(" + d + ") = " + ceil(d))
+end for
+print("")
