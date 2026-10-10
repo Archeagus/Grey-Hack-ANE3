@@ -1,0 +1,2 @@
+The client wants the login credentials of the user Duns.
+The public IP of the victim is 71.88.129.37. It's important that you access the correct machine behind the public IP. The victim's local IP is 192.168.8.10

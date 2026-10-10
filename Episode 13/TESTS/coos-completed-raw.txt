@@ -1,0 +1,9 @@
+From: Shinald@nuginawin.com
+Subject: Mission Contract
+The client wants you to enter a remote machine and get a file that contains important information for him.
+
+The <color=#FF8F00FF>public IP</color> of the victim is <b>219.109.10.103</b> and the <color=#FF8F00FF>local IP</color> where the file is located is <b>192.168.2.4</b> on the path <b>/home/Coos/sales_report.bin</b>.
+
+> Done.
+
+The customer is satisfied with the job. There has been an income in your account.

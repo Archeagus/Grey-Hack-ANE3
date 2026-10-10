@@ -1,0 +1,68 @@
+// ANE3 context regression tests v0.1.0. Read-only; seed rules required.
+shell = get_shell
+computer = shell.host_computer
+import_code("/home/Archeagus/ANE3/SRC/LIB/lib_functions.src")
+import_code("/home/Archeagus/ANE3/SRC/LIB/lib_mission_context.src")
+rulesFile = computer.File(ane_path("CONFIG") + "/mission-context-rules.db")
+if rulesFile == null then exit("Install seed rules first")
+rulesText = safe_content(rulesFile)
+passed = 0
+failed = 0
+check = function(label, actual, expected)
+    if actual == expected then
+        globals.passed = globals.passed + 1
+        print("PASS: " + label)
+    else
+        globals.failed = globals.failed + 1
+        print("FAIL: " + label + " expected=" + expected + " actual=" + actual)
+    end if
+end function
+coos = "From: Shinald@nuginawin.com" + char(10) + "Subject: Mission Contract" + char(10) + "The client wants you to enter a remote machine and get a file that contains important information for him." + char(10) + "" + char(10) + "The <color=#FF8F00FF>public IP</color> of the victim is <b>219.109.10.103</b> and the <color=#FF8F00FF>local IP</color> where the file is located is <b>192.168.2.4</b> on the path <b>/home/Coos/sales_report.bin</b>." + char(10) + "" + char(10) + "> Done." + char(10) + "" + char(10) + "The customer is satisfied with the job. There has been an income in your account."
+uilezni = "The client wants the login credentials of the user Uilezni." + char(10) + "The public IP of the victim is 90.236.175.2. It's important that you access the correct machine behind the public IP. The victim's local IP is 192.168.0.2"
+duns = "The client wants the login credentials of the user Duns." + char(10) + "The public IP of the victim is 71.88.129.37. It's important that you access the correct machine behind the public IP. The victim's local IP is 192.168.8.10"
+anyuser = "The client wants the login credentials of any user on the remote machine." + char(10) + "The public IP of the victim is 94.42.187.123. It's important that you access the correct machine behind the public IP. The victim's local IP is 192.168.1.3"
+check("seed rules valid", ctx_validate(rulesText).len, 0)
+a = ctx_interpret(coos, rulesText)
+check("Coos parsed", a["status"], "PARSED")
+check("Coos path", a["file_path"], "/home/Coos/sales_report.bin")
+check("Coos inferred user", a["target_user"], "Coos")
+check("Coos provenance", a["user_provenance"], "INFERRED_HOME_PATH")
+check("Coos not a required login", a["user_requirement"], "UNSTATED")
+check("original public address", a["target_ip"], "219.109.10.103")
+check("original LAN address", a["target_lan_ip"], "192.168.2.4")
+check("reply boundary", a["boundary"], "OPERATOR_REPLY")
+b = ctx_interpret(uilezni, rulesText)
+check("named parsed", b["status"], "PARSED")
+check("named case preserved", b["target_user"], "Uilezni")
+check("named requirement", b["user_requirement"], "SPECIFIC")
+b = ctx_interpret(duns, rulesText)
+check("held-out Duns parsed", b["status"], "PARSED")
+check("held-out Duns name", b["target_user"], "Duns")
+b = ctx_interpret(anyuser, rulesText)
+check("ANY parsed", b["status"], "PARSED")
+check("ANY requirement", b["user_requirement"], "ANY")
+check("ANY has no invented username", b["target_user"], "")
+b = ctx_interpret(uilezni + char(10) + "> get a file that contains important information 1.2.3.4", rulesText)
+check("reply cannot change family", b["family"], "CREDENTIAL_RETRIEVAL")
+check("reply cannot change address", b["target_ip"], "90.236.175.2")
+b = ctx_interpret("The client wants the login credentials of the user Uilezni.", rulesText)
+check("missing IP needs review", b["status"], "NEEDS_REVIEW")
+b = ctx_interpret("This unknown story mentions 109.129.107.236 and 192.168.0.4", rulesText)
+check("unrecognized text remains unknown", b["status"], "UNKNOWN")
+b = ctx_interpret(uilezni + char(10) + "The public IP of the victim is 1.2.3.4", rulesText)
+check("repeated anchor needs review", b["status"], "NEEDS_REVIEW")
+conflict = rulesText + char(10) + "rule=collision" + char(10) + "revision=1" + char(10) + "family=TEST" + char(10) + "action=TEST" + char(10) + "match=login credentials" + char(10) + "end"
+b = ctx_interpret(uilezni, conflict)
+check("conflicting rules not ranked silently", b["status"], "AMBIGUOUS")
+check("ambiguous has no chosen rule", b["rule_id"], "")
+check("duplicate rule IDs rejected", ctx_validate(rulesText + char(10) + rulesText).len > 0, 1)
+b = ctx_extract("Name: Uilezni", "Name:", " missing terminator")
+check("missing literal end flagged", b[1], "END_NOT_FOUND")
+check("malformed structure rejected", ctx_validate("rule=broken").len > 0, 1)
+b = ctx_interpret(anyuser.replace("192[.]168[.]1[.]3", "172.16.17.14"), rulesText)
+check("172 LAN supported", b["target_lan_ip"], "172.16.17.14")
+b = ctx_interpret(anyuser.replace("192[.]168[.]1[.]3", "10.0.6.2"), rulesText)
+check("10 LAN supported", b["target_lan_ip"], "10.0.6.2")
+b = ctx_interpret(anyuser.replace("192[.]168[.]1[.]3", "999.0.0.1"), rulesText)
+check("invalid IP rejected", b["status"], "NEEDS_REVIEW")
+print("RESULT: " + passed + " passed; " + failed + " failed")

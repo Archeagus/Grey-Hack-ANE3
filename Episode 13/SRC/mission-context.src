@@ -1,0 +1,197 @@
+// ANE3 Mission Context Editor v0.1.0 - isolated preview stage
+// ANE3_META|type=script|name=mission-context|version=0.1.0|last_version=0.1.0|last_bld=1000
+// Writes only CONFIG/mission-context-rules.db and its .previous backup.
+// No MissionScan deployment, mail access, target seeding, or mission writes.
+shell = get_shell
+computer = shell.host_computer
+import_code("/home/Archeagus/ANE3/SRC/LIB/lib_functions.src")
+import_code("/home/Archeagus/ANE3/SRC/LIB/lib_mission_context.src")
+
+editor_checked_write = function(fileObj, content)
+    if fileObj == null then return 0
+    if fileObj.set_content(content) != 1 then return 0
+    return safe_content(fileObj) == content
+end function
+
+editor_input = function(prompt)
+    return user_input(prompt).trim
+end function
+
+editor_combined = function(baseline, draft, originalId)
+    rules = ctx_rules(baseline)[0]
+    output = ["# ANE3 mission context rules. Saved by mission-context v0.1.0"]
+    replaced = 0
+    for rule in rules
+        if ctx_get(rule, "rule") == originalId then
+            output.push(draft.join(char(10)))
+            replaced = 1
+        else
+            output.push(rule.join(char(10)))
+        end if
+        output.push("end")
+        output.push("")
+    end for
+    if not replaced then
+        output.push(draft.join(char(10)))
+        output.push("end")
+    end if
+    return output.join(char(10))
+end function
+
+editor_show = function(draft)
+    print_log("Draft rule (not saved)", "#4da6ff")
+    for i in draft.indexes
+        print((i + 1) + ": " + draft[i])
+    end for
+end function
+
+rulesPath = ane_path("CONFIG") + "/mission-context-rules.db"
+rulesFile = computer.File(rulesPath)
+if rulesFile == null then exit("First copy mission-context-rules.db to " + rulesPath)
+baseline = safe_content(rulesFile)
+errors = ctx_validate(baseline)
+if errors.len > 0 then exit("Existing rules need repair in the text editor:" + char(10) + errors.join(char(10)))
+
+print_log("ANE3 MISSION CONTEXT v0.1.0", "#4da6ff")
+print("Preview stage. Existing MissionScan still uses its own parser.")
+print("Rule edits remain drafts until a successful preview and explicit save.")
+print("Blank field values do not imply ANY. Recognition phrases ignore case.")
+
+while 1
+    rules = ctx_rules(baseline)[0]
+    print_log("Rules", "#4da6ff")
+    for i in rules.indexes
+        print((i + 1) + ": " + ctx_get(rules[i], "rule") + " r" + ctx_get(rules[i], "revision"))
+    end for
+    selection = editor_input("Rule number, N=new, P=preview saved rules, Q=quit: ").lower
+    if selection == "q" then exit("Context editor closed.")
+    if selection == "p" then
+        path = editor_input("RAW mission ID (e.g. M-000007) or absolute text-file path: ")
+        if path.indexOf("M-") == 0 then path = ane_path("MISSIONS") + "/RAW/" + path + ".txt"
+        inputFile = computer.File(path)
+        if inputFile == null then
+            print_log("File not found", "yellow")
+        else
+            ctx_display(ctx_interpret(safe_content(inputFile), baseline))
+        end if
+        continue
+    end if
+    draft = []
+    originalId = ""
+    nextRevision = 1
+    if selection == "n" then
+        id = editor_input("New rule ID (letters/digits/underscore/hyphen): ")
+        family = editor_input("Family (e.g. POLICE_RECORD): ")
+        action = editor_input("Action (e.g. REMOVE_CHARGE): ")
+        phrase = editor_input("Required recognition phrase: ")
+        draft = ["rule=" + id, "revision=1", "family=" + family, "action=" + action, "match=" + phrase]
+    else
+        if not selection.is_match("^[1-9][0-9]*$") then continue
+        index = selection.to_int - 1
+        if index >= rules.len then continue
+        originalId = ctx_get(rules[index], "rule")
+        nextRevision = ctx_get(rules[index], "revision").to_int + 1
+        for line in rules[index]
+            if line.indexOf("revision=") == 0 then
+                draft.push("revision=" + nextRevision)
+            else
+                draft.push(line)
+            end if
+        end for
+    end if
+    previewed = ""
+    while 1
+        editor_show(draft)
+        print("M=match X=exclude E=extract S=set R=require D=derive home owner")
+        print("L=replace line A=append raw rule line -=remove line P=preview V=validate W=save B=back")
+        command = editor_input("> ").lower
+        if command == "b" then
+            if editor_input("Discard unsaved draft? Type YES: ") == "YES" then break
+            continue
+        end if
+        if command == "m" then draft.push("match=" + editor_input("Required phrase: "))
+        if command == "x" then draft.push("exclude=" + editor_input("Excluded phrase: "))
+        if command == "e" then
+            print("Fields: " + CTX_FIELDS.join(", "))
+            field = editor_input("Destination field: ")
+            anchor = editor_input("Literal text BEFORE value: ")
+            ending = editor_input("Literal text AFTER value, or @WORD / @LINE: ")
+            draft.push("extract=" + field + "|" + anchor + "|" + ending)
+        end if
+        if command == "s" then
+            print("Fields: " + CTX_FIELDS.join(", "))
+            field = editor_input("Destination field: ")
+            value = editor_input("Fixed value (user_requirement: SPECIFIC / ANY / UNSTATED / NOT_APPLICABLE): ")
+            draft.push("set=" + field + "|" + value)
+        end if
+        if command == "r" then draft.push("require=" + editor_input("Required field: "))
+        if command == "d" then draft.push("derive=target_user|HOME_OWNER")
+        if command == "a" then draft.push(editor_input("Rule line (key=value): "))
+        if command == "l" or command == "-" then
+            number = editor_input("Line number: ")
+            if not number.is_match("^[1-9][0-9]*$") then continue
+            index = number.to_int - 1
+            if index >= draft.len then continue
+            if draft[index].indexOf("rule=") == 0 or draft[index].indexOf("revision=") == 0 then
+                print_log("Rule identity and revision are managed by the editor.", "yellow")
+                continue
+            end if
+            revised = []
+            for i in draft.indexes
+                if i != index then
+                    revised.push(draft[i])
+                else if command == "l" then
+                    revised.push(editor_input("Replacement key=value: "))
+                end if
+            end for
+            draft = revised
+        end if
+        combined = editor_combined(baseline, draft, originalId)
+        if command == "v" or command == "p" or command == "w" then
+            errors = ctx_validate(combined)
+            if ctx_get(draft, "revision") != "" + nextRevision then errors.push("Revision is editor-managed")
+            if originalId != "" and ctx_get(draft, "rule") != originalId then errors.push("Cannot rename an existing rule")
+            if errors.len > 0 then
+                print_log(errors.join(char(10)), "yellow")
+                continue
+            end if
+            if command == "v" then print_log("Rule structure valid. Matching still needs preview.", "green")
+        end if
+        if command == "p" then
+            path = editor_input("RAW mission ID or absolute text-file path: ")
+            if path.indexOf("M-") == 0 then path = ane_path("MISSIONS") + "/RAW/" + path + ".txt"
+            inputFile = computer.File(path)
+            if inputFile == null then
+                print_log("File not found", "yellow")
+                continue
+            end if
+            result = ctx_interpret(safe_content(inputFile), combined)
+            ctx_display(result)
+            if result["status"] == "PARSED" and result["rule_id"] == ctx_get(draft, "rule") then
+                previewed = combined
+            else
+                previewed = ""
+                print_log("Draft must parse its example without conflicts before saving.", "yellow")
+            end if
+        end if
+        if command == "w" then
+            if previewed != combined then
+                print_log("Preview this exact draft successfully first (P).", "yellow")
+                continue
+            end if
+            if editor_input("Save this rule revision? Type SAVE: ") != "SAVE" then continue
+            if safe_content(rulesFile) != baseline then exit("Rules changed outside this session. Draft not saved; restart editor.")
+            backup = init_file("mission-context-rules.db.previous", "CONFIG")
+            if not editor_checked_write(backup, baseline) then
+                print_log("Backup failed; current rules not changed.", "red")
+                continue
+            end if
+            if not editor_checked_write(rulesFile, combined) then
+                exit("Rule write/verification failed. Prior content is in " + rulesPath + ".previous")
+            end if
+            baseline = combined
+            print_log("Rule saved. Mission records and queues unchanged.", "green")
+            break
+        end if
+    end while
+end while

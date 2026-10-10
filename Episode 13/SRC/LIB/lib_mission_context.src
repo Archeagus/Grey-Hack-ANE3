@@ -1,0 +1,314 @@
+// ANE3 mission context interpreter v0.1.0 - preview stage
+// Imports no mail, network, or filesystem operations. Rules are data only.
+// Requires lib_functions.src. Both the editor and future MissionScan use
+// ctx_interpret(rawText, rulesText). Does not mutate mission records.
+// ANE3_META|type=lib|name=lib_mission_context|version=0.1.0|last_version=0.1.0|last_bld=1000
+CTX_VERSION = "0.1.0"
+CTX_FIELDS = ["target_ip", "target_lan_ip", "target_user", "user_requirement", "user_provenance", "target_name", "file_path", "address_role", "location_certainty", "objective", "constraint", "hint", "submission", "charge", "year", "academic_subject", "grade_mode", "grade_delta", "evidence_requirement"]
+
+ctx_contains = function(items, value)
+    for item in items
+        if item == value then return 1
+    end for
+    return 0
+end function
+
+ctx_get = function(lines, key, fallback="")
+    prefix = key + "="
+    for line in lines
+        if line.indexOf(prefix) == 0 then return slice(line, prefix.len)
+    end for
+    return fallback
+end function
+
+ctx_values = function(lines, key)
+    values = []
+    prefix = key + "="
+    for line in lines
+        if line.indexOf(prefix) == 0 then values.push(slice(line, prefix.len))
+    end for
+    return values
+end function
+
+ctx_unperiod = function(value)
+    value = value.trim
+    if value.len > 0 then
+        if slice(value, value.len - 1) == "." then value = slice(value, 0, value.len - 1)
+    end if
+    return value
+end function
+
+// Returns [original contract body, boundary description]. RAW is unchanged.
+// Verified layout: From/Subject headers, contract, > operator reply, feedback.
+// Repeated mail headers and known feedback phrases are also stop boundaries.
+// Input without headers is supported for body-only fixtures.
+ctx_contract = function(rawText)
+    clean = rawText.replace("<[^>]*>", "").replace(char(13), "")
+    lines = clean.split(char(10))
+    startAt = 0
+    for i in lines.indexes
+        if lines[i].trim.lower.indexOf("subject:") == 0 then
+            startAt = i + 1
+            break
+        end if
+    end for
+    body = []
+    boundary = "END_OF_INPUT"
+    for i in lines.indexes
+        if i < startAt then continue
+        line = lines[i].trim
+        low = line.lower
+        stop = ""
+        if line.indexOf(">") == 0 then stop = "OPERATOR_REPLY"
+        if low.indexOf("from:") == 0 or low.indexOf("subject:") == 0 then stop = "NEXT_HEADER"
+        if low.indexOf("the customer is satisfied with the job") == 0 then stop = "CLIENT_FEEDBACK"
+        if low.indexOf("you have not completed the order requirements") == 0 then stop = "CLIENT_FEEDBACK"
+        if stop != "" then
+            boundary = stop
+            break
+        end if
+        body.push(line)
+    end for
+    return [body.join(char(10)).trim, boundary]
+end function
+
+// Format: rule=id ... end. Blank lines/comments ignored; order preserved.
+// Returns [rules, structural errors]. A rule is a list of key=value strings.
+ctx_rules = function(text)
+    rules = []
+    errors = []
+    current = []
+    opened = 0
+    for rawLine in text.replace(char(13), "").split(char(10))
+        line = rawLine.trim
+        if line == "" or line.indexOf("#") == 0 then continue
+        if line.indexOf("rule=") == 0 then
+            if opened then errors.push("New rule before previous end")
+            opened = 1
+            current = [line]
+        else if line == "end" then
+            if not opened then
+                errors.push("end without rule")
+            else
+                rules.push(current)
+            end if
+            opened = 0
+            current = []
+        else
+            if not opened then
+                errors.push("Line outside a rule: " + line)
+            else
+                current.push(line)
+            end if
+        end if
+    end for
+    if opened then errors.push("Missing end")
+    return [rules, errors]
+end function
+
+ctx_validate = function(rulesText)
+    parsed = ctx_rules(rulesText)
+    errors = parsed[1]
+    ids = []
+    allowed = ["rule", "revision", "family", "action", "match", "exclude", "set", "extract", "require", "derive"]
+    for rule in parsed[0]
+        id = ctx_get(rule, "rule")
+        if not id.is_match("^[a-zA-Z0-9_-]+$") then errors.push("Invalid rule ID: " + id)
+        if ctx_contains(ids, id) then errors.push("Duplicate rule ID: " + id)
+        ids.push(id)
+        for key in ["rule", "revision", "family", "action"]
+            vals = ctx_values(rule, key)
+            if vals.len != 1 then errors.push(id + ": need exactly one " + key)
+            if ctx_get(rule, key) == "" then errors.push(id + ": empty " + key)
+        end for
+        if not ctx_get(rule, "revision").is_match("^[1-9][0-9]*$") then errors.push(id + ": revision must be a positive integer")
+        if ctx_values(rule, "match").len == 0 then errors.push(id + ": needs a recognition phrase")
+        assigned = []
+        for line in rule
+            eq = line.indexOf("=")
+            if eq == null then
+                errors.push(id + ": missing = in " + line)
+                continue
+            end if
+            key = slice(line, 0, eq)
+            value = slice(line, eq + 1)
+            if not ctx_contains(allowed, key) then errors.push(id + ": unknown key " + key)
+            if value.trim == "" then errors.push(id + ": empty " + key)
+            if key == "set" or key == "extract" or key == "derive" then
+                parts = value.split("[|]")
+                expected = 2
+                if key == "extract" then expected = 3
+                if parts.len != expected then
+                    errors.push(id + ": wrong number of parts for " + key)
+                    continue
+                end if
+                field = parts[0]
+                if not ctx_contains(globals.CTX_FIELDS, field) then errors.push(id + ": unknown field " + field)
+                if ctx_contains(assigned, field) then errors.push(id + ": duplicate field assignment " + field)
+                assigned.push(field)
+                if parts[1].trim == "" then errors.push(id + ": empty value/anchor")
+                if key == "extract" and parts[2].trim == "" then errors.push(id + ": empty extraction end")
+                if key == "derive" then
+                    if field != "target_user" or parts[1] != "HOME_OWNER" then errors.push(id + ": only derive=target_user|HOME_OWNER supported")
+                    if ctx_contains(assigned, "user_provenance") then errors.push(id + ": HOME_OWNER owns user_provenance")
+                    assigned.push("user_provenance")
+                end if
+                if key == "set" and field == "user_requirement" then
+                    if not ctx_contains(["SPECIFIC", "ANY", "UNSTATED", "NOT_APPLICABLE"], parts[1]) then errors.push(id + ": invalid user_requirement")
+                end if
+            end if
+            if key == "require" then
+                if not ctx_contains(globals.CTX_FIELDS, value) then errors.push(id + ": unknown required field " + value)
+            end if
+        end for
+    end for
+    if parsed[0].len == 0 then errors.push("No rules")
+    return errors
+end function
+
+// Literal, case-insensitive anchors; values preserve original case.
+// @WORD = whitespace-delimited token; @LINE = remainder of the line.
+// Otherwise end is a required literal delimiter on the same line.
+// Multiple occurrences are reported rather than guessed, even if identical.
+ctx_extract = function(body, anchor, ending)
+    low = body.lower
+    pos = low.indexOf(anchor.lower)
+    if pos == null then return ["", "ANCHOR_NOT_FOUND"]
+    if low.indexOf(anchor.lower, pos + anchor.len) != null then return ["", "AMBIGUOUS_ANCHOR"]
+    tail = slice(body, pos + anchor.len)
+    tail = tail.split(char(10))[0].trim
+    if ending == "@WORD" then
+        tail = tail.replace(char(9), " ").split(" ")[0]
+    else if ending != "@LINE" then
+        stop = tail.lower.indexOf(ending.lower)
+        if stop == null then return ["", "END_NOT_FOUND"]
+        tail = slice(tail, 0, stop)
+    end if
+    value = ctx_unperiod(tail)
+    if value == "" then return ["", "EMPTY"]
+    return [value, "EXPLICIT"]
+end function
+
+ctx_interpret = function(rawText, rulesText)
+    result = {"status":"UNKNOWN", "family":"UNKNOWN", "action":"", "rule_id":"", "rule_revision":"", "matches":[], "issues":[], "trace":[], "contract":"", "boundary":""}
+    for field in globals.CTX_FIELDS
+        result[field] = ""
+    end for
+    result["user_requirement"] = "UNSTATED"
+    split = ctx_contract(rawText)
+    result["contract"] = split[0]
+    result["boundary"] = split[1]
+    errors = ctx_validate(rulesText)
+    if errors.len > 0 then
+        result["status"] = "INVALID_RULES"
+        result["issues"] = errors
+        return result
+    end if
+    rules = ctx_rules(rulesText)[0]
+    matched = []
+    low = split[0].lower
+    for rule in rules
+        applies = 1
+        for phrase in ctx_values(rule, "match")
+            if low.indexOf(phrase.lower) == null then applies = 0
+        end for
+        for phrase in ctx_values(rule, "exclude")
+            if low.indexOf(phrase.lower) != null then applies = 0
+        end for
+        if applies then
+            matched.push(rule)
+            result["matches"].push(ctx_get(rule, "rule"))
+        end if
+    end for
+    if matched.len == 0 then return result
+    if matched.len > 1 then
+        result["status"] = "AMBIGUOUS"
+        result["issues"].push("Multiple matching rules; no interpretation selected")
+        return result
+    end if
+    rule = matched[0]
+    result["rule_id"] = ctx_get(rule, "rule")
+    result["rule_revision"] = ctx_get(rule, "revision")
+    result["family"] = ctx_get(rule, "family")
+    result["action"] = ctx_get(rule, "action")
+    for phrase in ctx_values(rule, "match")
+        result["trace"].push("MATCH: " + phrase)
+    end for
+    for spec in ctx_values(rule, "set")
+        parts = spec.split("[|]")
+        result[parts[0]] = parts[1]
+        result["trace"].push(parts[0] + " <- rule value")
+    end for
+    for spec in ctx_values(rule, "extract")
+        parts = spec.split("[|]")
+        extracted = ctx_extract(split[0], parts[1], parts[2])
+        value = extracted[0]
+        if value != "" and (parts[0] == "target_ip" or parts[0] == "target_lan_ip") then
+            if not is_valid_ip(value) then
+                value = ""
+                extracted[1] = "INVALID_IP"
+            else
+                if parts[0] == "target_ip" and is_lan_ip(value) then
+                    value = ""
+                    extracted[1] = "EXPECTED_PUBLIC_IP"
+                end if
+                if parts[0] == "target_lan_ip" and not is_lan_ip(value) then
+                    value = ""
+                    extracted[1] = "EXPECTED_LOCAL_IP"
+                end if
+            end if
+        end if
+        result[parts[0]] = value
+        result["trace"].push(parts[0] + " <- " + extracted[1] + " after: " + parts[1])
+        if extracted[1] != "EXPLICIT" and extracted[1] != "ANCHOR_NOT_FOUND" then result["issues"].push(parts[0] + ": " + extracted[1])
+    end for
+    for spec in ctx_values(rule, "derive")
+        path = result["file_path"]
+        if path.indexOf("/home/") == 0 then
+            rest = slice(path, 6)
+            stop = rest.indexOf("/")
+            if stop != null and stop > 0 then
+                result["target_user"] = slice(rest, 0, stop)
+                result["user_provenance"] = "INFERRED_HOME_PATH"
+                result["trace"].push("target_user <- inferred from file_path; not a login requirement")
+            end if
+        end if
+    end for
+    for field in ctx_values(rule, "require")
+        if result[field] == "" then result["issues"].push("Required field missing: " + field)
+    end for
+    if result["user_requirement"] == "SPECIFIC" and result["target_user"] == "" then result["issues"].push("Specific user required but not extracted")
+    if result["user_requirement"] == "ANY" and result["target_user"] != "" then result["issues"].push("ANY conflicts with a specific username")
+    result["status"] = "PARSED"
+    if result["issues"].len > 0 then result["status"] = "NEEDS_REVIEW"
+    return result
+end function
+
+ctx_display = function(result)
+    print_log("Interpretation: " + result["status"], "#4da6ff")
+    print("Rule: " + result["rule_id"] + " revision " + result["rule_revision"])
+    print("Matches: " + result["matches"].join(", "))
+    print("Family/action: " + result["family"] + " / " + result["action"])
+    print("Contract boundary: " + result["boundary"])
+    for field in globals.CTX_FIELDS
+        value = result[field]
+        // Always show the common identity fields; omit irrelevant empty extras.
+        if value == "" and not ctx_contains(["target_ip", "target_lan_ip", "target_user"], field) then continue
+        if field == "target_user" and result["user_requirement"] == "ANY" then value = "ANY"
+        if field == "target_user" and result["user_requirement"] == "NOT_APPLICABLE" then value = "N/A"
+        if value == "" then
+            value = "NOT SUPPLIED"
+            if ctx_contains(result["issues"], "Required field missing: " + field) then value = "UNKNOWN - REQUIRED"
+            if field == "target_user" and result["user_requirement"] == "SPECIFIC" then value = "UNKNOWN - REQUIRED"
+        end if
+        color = "white"
+        if value == "ANY" then color = "#B39DDB"
+        print_log(field + ": " + value, color)
+    end for
+    for issue in result["issues"]
+        print_log("REVIEW: " + issue, "yellow")
+    end for
+    for evidence in result["trace"]
+        print_log(evidence, "#999999")
+    end for
+end function

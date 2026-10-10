@@ -1,0 +1,54 @@
+# ANE3 context rules v0.1.0. Literal anchors; all match lines are required.
+# | separates field, start anchor, and end marker. It is not a regex.
+rule=file_retrieve_named
+revision=1
+family=FILE_RETRIEVAL
+action=RETRIEVE_FILE
+match=get a file that contains important information
+set=user_requirement|UNSTATED
+set=address_role|OBJECTIVE_TARGET
+set=location_certainty|STATED
+set=objective|Obtain the specified file
+extract=target_ip|The public IP of the victim is|@WORD
+extract=target_lan_ip|the local IP where the file is located is|@WORD
+extract=file_path|on the path|@WORD
+derive=target_user|HOME_OWNER
+require=target_ip
+require=target_lan_ip
+require=file_path
+end
+
+rule=credentials_named
+revision=1
+family=CREDENTIAL_RETRIEVAL
+action=GET_CREDENTIALS
+match=login credentials of the user
+exclude=login credentials of any user
+set=user_requirement|SPECIFIC
+set=user_provenance|EXPLICIT_CONTRACT
+set=address_role|OBJECTIVE_TARGET
+set=location_certainty|STATED
+set=objective|Obtain login credentials for the specified user on the specified machine
+extract=target_user|login credentials of the user|@WORD
+extract=target_ip|The public IP of the victim is|@WORD
+extract=target_lan_ip|The victim's local IP is|@WORD
+require=target_user
+require=target_ip
+require=target_lan_ip
+end
+
+rule=credentials_any
+revision=1
+family=CREDENTIAL_RETRIEVAL
+action=GET_CREDENTIALS
+match=login credentials of any user
+set=user_requirement|ANY
+set=user_provenance|EXPLICIT_CONTRACT
+set=address_role|OBJECTIVE_TARGET
+set=location_certainty|STATED
+set=objective|Obtain login credentials for any user on the specified machine
+extract=target_ip|The public IP of the victim is|@WORD
+extract=target_lan_ip|The victim's local IP is|@WORD
+require=target_ip
+require=target_lan_ip
+end
